@@ -1,0 +1,18 @@
+{
+    "name": "PaperS3 微信读书",
+    "description": "M5Stack PaperS3 微信读书墨水屏阅读器：配网门户、扫码登录、封面书架、图文混排、快刷翻页、进度云同步、字体切换、浅睡唤醒。全程不需要电脑。",
+    "keywords": "PaperS3, ESP32-S3, e-paper, weread, reader, 微信读书",
+    "author": "nasonliu",
+    "repository": "https://github.com/nasonliu/papers3-weread",
+    "firmware_category": [
+        {
+            "PaperS3": {
+                "path": "firmware",
+                "device": ["M5Stack PaperS3"],
+                "default_baud": 921600
+            }
+        }
+    ],
+    "version": "0.1.0",
+    "framework": "Arduino/ESP-IDF"
+}
