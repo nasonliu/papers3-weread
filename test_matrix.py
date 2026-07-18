@@ -34,16 +34,20 @@ def cmd(c, wait=0.3):
     time.sleep(wait)
 
 def wait_boot():
+    """等设备就绪：发 's' 直到看到书架刷新或书架列表（设备可能在下载插图，耐心等）"""
     lines = []
-    t0 = time.time()
-    while time.time() - t0 < 75:
-        line = s.readline()
-        if not line:
-            continue
-        txt = line.decode('utf-8', 'replace').rstrip()
-        lines.append(txt)
-        if '[书架]' in txt:
-            return lines
+    for attempt in range(15):  # 20s x 15 = 最多 5 分钟
+        s.write(b's\n'); s.flush()
+        t1 = time.time()
+        while time.time() - t1 < 20:
+            line = s.readline()
+            if not line:
+                continue
+            txt = line.decode('utf-8', 'replace').rstrip()
+            lines.append(txt)
+            if '[书架]' in txt or '[刷新]' in txt:
+                return lines
+        print(f'  就绪等待中（第 {attempt+1} 轮，设备可能在下载插图）...')
     raise RuntimeError('等待书架超时')
 
 def find_book(lines, kw):
@@ -62,8 +66,21 @@ def check_health(tag):
     return True
 
 print('=== 启动，等设备就绪 ===')
-boot = wait_boot()
-print('书架就绪\n')
+# 反复发 's' 激活，再发 'books' 拿书单；书单为空说明还在启动中，继续等
+boot = []
+t0 = time.time()
+while time.time() - t0 < 300:
+    s.write(b's\n'); s.flush()
+    drain(3)
+    s.write(b'books\n'); s.flush()
+    boot = drain(6, lambda t: t.strip().startswith(tuple(f'{i}.' for i in range(1, 200))) and '[' in t)
+    if len(boot) >= 5:
+        break
+    print(f'  等书架加载中（当前 {len(boot)} 本）...')
+    time.sleep(3)
+if len(boot) < 5:
+    raise RuntimeError('书架加载超时')
+print(f'书架就绪（{len(boot)} 本）\n')
 
 results = []
 for kw, ch, label in BOOKS:

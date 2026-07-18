@@ -1794,6 +1794,23 @@ void loop() {
                           WR.getCookie("wr_vid").c_str(), WR.getCookie("wr_skey").c_str(), WR.getCookie("wr_rt").c_str());
             return;
         }
+        if (line == "usb") { // 诊断：USB/充电状态（自动休眠门控用）
+            Serial.printf("[usb] GPIO5(USB_DET)=%d isCharging=%d\n",
+                          gpio_get_level(GPIO_NUM_5), (int)M5.Power.isCharging());
+            return;
+        }
+        if (line == "books") { // 打印当前书架（测试用）
+            for (size_t i = 0; i < g_shelf.size(); i++)
+                Serial.printf("  %d. %s [%s]\n", i + 1, g_shelf[i].title.c_str(), g_shelf[i].bookId.c_str());
+            return;
+        }
+        if (line == "imgoff") { // 切换当前书插图开关（卡下载时解围用）
+            bool now = !book_img_off(g_cur_book.bookId);
+            book_img_off_set(g_cur_book.bookId, now);
+            Serial.printf("[img] 插图开关 → %s\n", now ? "关" : "开");
+            if (g_screen == SCR_READING && !g_pages.empty()) render_page(epd_mode_t::epd_quality, true);
+            return;
+        }
         if (line == "imgs") { // 导出当前章图片块 URL（图片问题调试用）
             int i = 0;
             for (auto& b : g_blocks) if (b.is_image) Serial.printf("[img块 %d] %s\n", ++i, b.text.c_str());
@@ -1838,8 +1855,9 @@ void loop() {
         }
     }
 
-    // 闲置自动休眠（接着 USB 时不睡：方便调试/充电；enter_sleep 浅睡不返回；失败兜底会回来继续跑）
-    if (millis() - g_last_activity > AUTO_SLEEP_MS && gpio_get_level(GPIO_NUM_5) != 1) enter_sleep();
+    // 闲置自动休眠（充电中=接着 USB 就不睡；浅睡不返回；失败兜底会回来继续跑）
+    bool usb_in = (M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging);
+    if (millis() - g_last_activity > AUTO_SLEEP_MS && !usb_in) enter_sleep();
 
     // keep-alive 会话闲置关闭（释放 DRAM，防后续请求 TLS 内存不足 -0x7F00）
     static unsigned long last_hk = 0;
