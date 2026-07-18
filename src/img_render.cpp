@@ -104,6 +104,11 @@ static size_t https_get(const String& url, uint8_t* buf, size_t cap, bool with_c
     struct UseGuard { // RAII：在途计数，housekeeping 据此不关句柄
         volatile int& c; UseGuard(volatile int& c_) : c(c_) { c++; } ~UseGuard() { c--; }
     } guard(g_img_in_use);
+    // 节流：图片请求间隔 ≥300ms（连发会触发风控/服务器 RST）
+    static unsigned long last_req = 0;
+    unsigned long now = millis();
+    if (last_req && now - last_req < 300) delay(300 - (now - last_req));
+    last_req = millis();
     for (int attempt = 0; attempt < 2; attempt++) {
         // 会话不存在/host 变了/上次失败被丢弃 → 重建
         if (!g_img_client || g_img_host != host) {

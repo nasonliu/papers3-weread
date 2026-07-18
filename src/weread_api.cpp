@@ -392,7 +392,15 @@ struct ShardSession {
     esp_http_client_handle_t client = nullptr;
     ShardRespBuf rb;
     unsigned long last_use = 0; // 最近使用时间（闲置关闭用：TLS 常驻 ~50KB DRAM，久持会挤爆后续连接）
+    unsigned long last_req = 0; // 上次请求发起时间（请求节流用）
     volatile int in_use = 0;    // 在途请求计数（housekeeping 只在 0 时才允许关闭，否则关掉在途句柄必崩）
+
+    // 请求节流：两次请求至少隔 400ms，避免连发触发 weread 风控（实测连发会被 RST）
+    void pace() {
+        unsigned long now = millis();
+        if (last_req && now - last_req < 400) delay(400 - (now - last_req));
+        last_req = millis();
+    }
 
     // 建立连接（幂等）；host 固定 weread.qq.com，后续 set_url 换路径复用同一连接
     bool open() {
@@ -427,6 +435,7 @@ struct ShardSession {
         struct UseGuard { // RAII：在途计数，housekeeping 据此不关句柄
             volatile int& c; UseGuard(volatile int& c_) : c(c_) { c++; } ~UseGuard() { c--; }
         } guard(in_use);
+        pace(); // 节流：请求间隔 ≥400ms（防风控）
         if (!open()) return nullptr;
         if (!rb.psbuf) {
             rb.psbuf = (char*)heap_caps_malloc(ShardRespBuf::CAP, MALLOC_CAP_SPIRAM);

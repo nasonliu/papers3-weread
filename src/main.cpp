@@ -356,6 +356,7 @@ static void net_worker(void*) {
                 }
             }
             net_unlock();
+            delay(800); // 任务间节流：预取完成后歇一会再干下一个（防风控）
             continue;
         }
         // 封面预取（相邻书架页，翻页时封面已在缓存）
