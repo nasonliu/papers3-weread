@@ -1,0 +1,120 @@
+# PaperS3 微信读书阅读器
+
+把微信读书搬上 **M5Stack PaperS3**（ESP32-S3 + 4.7 寸墨水屏，540×960 竖屏）的独立阅读器固件。
+配网、登录、选书、阅读、进度同步，全程不需要电脑。
+
+![平台](https://img.shields.io/badge/platform-M5Stack%20PaperS3-blue) ![框架](https://img.shields.io/badge/framework-Arduino%20%2B%20ESP--IDF-green) ![状态](https://img.shields.io/badge/status-真机可用-brightgreen)
+
+---
+
+## 功能一览
+
+- **开机首屏**：微信读书图标 + 大标题，技术信息全部走串口
+- **配网门户**：无配置/WiFi 失败自动开热点 `PaperS3-阅读器`，手机/电脑网页选 WiFi 输密码（captive 自动弹窗），失败显示中文原因（密码错误/找不到网络/超时）
+- **扫码登录**：cookie 过期自动弹微信读书二维码，手机扫码即登录；令牌自动续期（wr_rt 换 wr_skey），登录一次长期免维护
+- **书架**：封面 5 本/页 + 最近阅读排序 + 阅读进度百分比；点行进详情
+- **书籍详情**：封面/标题/作者/出版社/简介/热门评论；[继续阅读]（服务器章级 + 本地页级进度）[下载整本]（进度条+可取消）[插图:开/关]
+- **正文阅读**：图文混排（JPEG/PNG/GIF 插图灰度上屏）、原书 h1-h4 标题样式（放大/仿粗体）、首行缩进两中文字符、段间距、版心居中
+- **快刷翻页**：`epd_fast` 异步推送 ~260ms，每 8 页自动全刷清残影；字形缓存让翻页 < 1s
+- **目录屏**：点左上角章节名进入，翻页/选章/返回
+- **进度同步**：本地 SD 页级进度 + 上传微信读书服务器（手机端进度互通）
+- **后台预取**：读完一章自动预拉下一章（正文+插图），翻到秒开
+- **休眠**：书架「睡眠」按钮或闲置 5 分钟 → 浅睡显示当前书封面，摸屏幕秒醒原地续读；按电源键硬重启也会自动恢复到上次阅读页
+- **字体**：SD 卡 EDCBook `.bin` 字体任意换（UI 固定霞鹜文楷，正文字体阅读页内实时切换，列表逐字体预览）
+
+## 硬件准备
+
+- M5Stack PaperS3（裸机即可，Type-C 供电）
+- TF 卡一张，放字体：
+  - `/font/霞鹜文楷_大.bin`（必需，UI 字体）
+  - 其它 EDCBook `.bin` 字体若干（正文可选字体，可从 EDCBook 阅读器卡上直接拷）
+
+## 首次使用（零电脑）
+
+1. 烧录固件（见下文）后开机，显示首屏
+2. 设备自动开热点 `PaperS3-阅读器`，屏幕显示提示
+3. 手机/电脑连上该热点（自动弹配网页，或浏览器开 `192.168.4.1`）
+4. 刷新扫描 → 选 WiFi → 输密码 → 连接；成功自动重启
+5. 重启后自动连 WiFi → 弹出微信读书二维码 → 微信扫码 → 进入书架
+
+以后每天：开机即用。cookie 失效会自动续期，续不动才再扫。
+
+## 操作说明
+
+### 书架页
+| 操作 | 位置 |
+|------|------|
+| 进书籍详情 | 点某一本书 |
+| 翻书架页 | 底部左半=上页 / 右半=下页 |
+| 睡眠 | 顶部「睡眠」 |
+| 重配 WiFi | 顶部「WiFi」 |
+| 重新登录 | 顶部「登录」 |
+
+### 书籍详情页
+- **继续阅读**：按进度跳到所读章节（服务器章级进度 + 本地页级进度）
+- **下载整本**：整本正文缓存到 SD（进度条显示，点按取消）
+- **插图：开/关**：图多的书关掉后完全不下载不渲染插图（按书记忆）
+
+### 阅读页
+| 操作 | 位置 |
+|------|------|
+| 下一页 | 右半屏 |
+| 上一页 | 左半屏 |
+| 目录 | 顶部左侧（章节名区域） |
+| 回书架 | 顶部中间 |
+| 换字体 | 顶部右侧「字体」 |
+
+- 章末再翻自动进下一章，章首回翻回上一章
+- 翻页 ~0.3s 推送，每 8 页自动全刷一次清残影
+
+### 目录屏
+- 点章节跳转；底部翻页；顶部返回正文
+
+### 字体页
+- 每行用它自己的字体渲染（所见即所得），点选立即重排预览
+- 选择记忆到配置文件；只影响正文，菜单永远用霞鹜文楷
+
+## 目录结构（SD 卡）
+
+```
+/font/                  字体（.bin）
+/weread/config.json     WiFi + cookie + 字体选择
+/weread/progress.json   每本书的本地阅读进度（章/页）
+/weread/state.json      上次阅读位置（重启恢复用）
+/weread/imgoff.json     各书插图开关
+/weread/cache/<bookId>/ toc.json / detail.json / ch_<uid>.blk
+/weread/img/            封面与插图缓存
+```
+
+## 编译与烧录
+
+```bash
+pip install platformio   # 或已有 pio
+cd papers3-weread
+pio run                  # 编译
+pio run -t upload --upload-port /dev/cu.usbmodem2101   # 烧录（端口按实际）
+```
+
+框架：Arduino + ESP-IDF 混合（PlatformIO `espressif32@6.13.0`）。依赖自动拉取（M5Unified / M5GFX / ArduinoJson / TJpg_Decoder / PNGdec / unzipLIB / AnimatedGIF）。
+
+## 常见问题
+
+- **屏幕字发虚/发白**：字体数据是 0=黑 的 4-bit 灰度，不要加反色；检查 `drawTextFontScaled` 的颜色映射
+- **登录又过期**：wr_skey 是短效令牌，设备会自动续期；如果 wr_rt 也死了才需要重扫
+- **拉取正文失败**：失败页会显示原因（网络/登录/风控），点按重试，顶部返回
+- **插图下载卡**：详情页把「插图」关掉；后台也会继续慢慢补
+- **休眠唤醒不了**：浅睡摸屏幕唤醒；按电源键是硬重启（会恢复到上次阅读页）
+
+## 调试（串口 115200）
+
+命令：`n/p` 翻页、`s` 书架、`sp/sm` 书架翻页、`t` 目录、`tp/tm` 目录翻页、`ts N` 选章、
+`N` 详情、`N:C` 直读第 C 章、`dl` 下载整本、`wifi` 配网、`login` 扫码、`cookie` 导出 cookie、
+`imgs` 当前章图片 URL、`fonts` 字体自检、`CFG {json}` 写配置。
+
+## 致谢
+
+- 协议参考：[weread.koplugin](https://github.com/finlater/weread.koplugin)（KOReader 微信读书插件）
+- 固件参考：[M5ReadPaper](https://github.com/shinemoon/M5ReadPaper)、[M5PaperS3-UserDemo](https://github.com/m5stack/M5PaperS3-UserDemo)
+- QR 生成：nayuki/QR-Code-generator（MIT）
+- 图片解码：TJpg_Decoder、PNGdec、AnimatedGIF、unzipLIB（bitbank2）
+- 字体：EDCBook 墨水屏阅读器点阵字库（霞鹜文楷等）

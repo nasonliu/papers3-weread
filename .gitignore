@@ -1,0 +1,8 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+weread_cookies.json
+weread_login_qr.png
+.DS_Store
+ref/
