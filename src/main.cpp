@@ -228,6 +228,13 @@ static void show_splash(const String& subtitle = "") {
     epd_flush(epd_mode_t::epd_quality);
 }
 
+// 首屏状态行：文字叠加在首屏底部（快刷，不做全屏慢闪；用于 连接WiFi/加载书架 等进度提示）
+static void splash_status(const String& text) {
+    canvas.fillRect(0, 660, SCREEN_W, 80, TFT_WHITE); // 只清状态区
+    drawUI(text, (SCREEN_W - textWidthUI(text)) / 2, 680);
+    epd_flush(epd_mode_t::epd_fast);
+}
+
 // ---------- 二维码登录页 ----------
 // weread_login 模块的 render_qr 回调：把 url 画成二维码 + 状态文字
 static void render_qr(const String& url, const String& status) {
@@ -1622,7 +1629,7 @@ void setup() {
     M5.Display.waitDisplay();
     canvas.setColorDepth(16);
     canvas.createSprite(SCREEN_W, SCREEN_H);
-    show_splash(); // 开机首屏：图标 + 微信读书（技术信息只走串口）
+    // 首屏推迟到字体加载完之后（一次就好，不刷两遍）
 
     // 触摸采集任务（10ms 高频，渲染/刷新期间也不丢点按）
     g_touch_q = xQueueCreate(8, sizeof(TouchPoint));
@@ -1677,7 +1684,7 @@ void setup() {
         }
         Serial.printf("[font] 正文 %s 字高=%d\n", g_read_font_path.c_str(), g_read_font.fontHeight());
     }
-    show_splash(); // 字体就绪后补一屏带文字的（首刷只有图标）
+    show_splash(); // 唯一一次首屏：图标+标题（字体已就绪）
 
     // ---- WiFi 配置检查：无配置给 5 秒串口 CFG 窗口（首屏保持），然后进配网门户 ----
     bool have_cfg = WR.wifi_ssid.length() && WR.hasValidCookie();
@@ -1696,7 +1703,7 @@ void setup() {
         Serial.printf("[cfg] 已加载保存的配置 ssid=%s\n", WR.wifi_ssid.c_str());
     }
 
-    show_splash("正在连接 WiFi...");
+    splash_status("正在连接 WiFi...");
     if (!WR.connectWiFi()) {
         Serial.println("[错误] WiFi 连接失败");
         run_provisioning_portal(screen_msg, "连接超时/密码错误"); // 永不返回（成功后重启）
@@ -1710,14 +1717,14 @@ void setup() {
     }
 
     // ---- 拉书架（兼 cookie 有效性检查；过期先续期，续不动再扫码登录）----
-    show_splash("正在加载书架...");
+    splash_status("正在加载书架...");
     String err;
     if (!weread_api::getBookshelf(g_shelf, err) || g_shelf.empty()) {
         if (err.indexOf("-2012") >= 0) {
             Serial.println("[login] cookie 过期(-2012)，先试 renewal 续期");
             if (WR.tryRenew()) {
                 err = "";
-                show_splash("正在加载书架...");
+                splash_status("正在加载书架...");
                 weread_api::getBookshelf(g_shelf, err); // 续期成功重拉
             }
         }
@@ -1725,7 +1732,7 @@ void setup() {
             Serial.println("[login] 续期失败，进入扫码登录");
             if (do_qr_login()) {
                 err = "";
-                show_splash("正在加载书架...");
+                splash_status("正在加载书架...");
                 if (!weread_api::getBookshelf(g_shelf, err) || g_shelf.empty()) {
                     screen_msg("书架获取失败", err, "点按屏幕重启");
                     wait_tap(600000);
