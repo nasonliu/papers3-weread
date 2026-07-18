@@ -1,7 +1,255 @@
 # PaperS3 微信读书阅读器 — 项目进度 / 交接文档
 
-> 最后更新：2026-07-17（阅读器完整形态版）
-> 状态：**产品形态可用**：开机首屏 → 自动连网/配网/扫码登录 → 封面书架（最近阅读排序）→ 书籍详情（继续阅读/下载整本）→ 图文混排阅读（快刷翻页/进度同步/字体切换）→ 休眠封面 + 开机恢复。
+> 最后更新：2026-07-18（网络对照与长书实机实验补充版）
+> 状态：**功能全链路可用并已发布 v0.1.0**（GitHub: nasonliu/papers3-weread）。**ESP32 访问 weread 接口间歇性 TCP 连接失败的底层根因仍未闭环；已另外确认同步网络重试会把偶发失败放大成数分钟的界面“卡住”**（见第〇节）。
+
+---
+
+## 〇、当前最大难点：设备端 weread 接口间歇性 TCP 连接失败
+
+### 现象
+- 设备访问 weread.qq.com 各接口（chapterInfos / reader / e_0/e_1/e_3 / book/info / review/list）**间歇性失败**：`HTTP_CLIENT: Connection failed, sock < 0`、`esp-tls: select() timeout`、`Software caused connection abort`、`delayed connect error`。
+- 概率性：同一小时内有成功有失败；**时间维度上午正常、下午开始恶化**。
+- 历史观察是 Mac 与 reMarkable 基本稳定，但本轮发现 Mac 开着本机 HTTP/HTTPS/SOCKS 代理（`127.0.0.1:7897`），即使 curl 禁用显式代理，目标路由仍经 `utun`/`198.18.0.1`。因此 Mac **不是与 PaperS3 同一条直连路径的有效对照**；本轮也没有确认 reMarkable 的实际出口路径，不能据此断言家用路由、出口 IP 或服务器端一定无关。
+
+### 已排除的假设（都做过修复/验证）
+| 假设 | 结论 |
+|------|------|
+| cookie 过期 | ❌ 设备会自动 renewal 续期，日志可见成功；且失败发生在 TCP 层（连接都没建立），未到鉴权 |
+| 本地 DRAM 不足（mbedtls -0x7F00） | ✅ 已修：mbedtls_platform_set_calloc_free 改 PSRAM 分配，未再出现 |
+| 本地 socket 耗尽（LWIP_MAX_SOCKETS=10） | ⚠️ 本轮未复现。生产 API 连续 20 次全部成功，内部 DRAM 在前几次下降后稳定，未见持续逐次下降；这只能排除本轮窗口内的持续泄漏，不能排除长时间运行后的状态问题 |
+| 请求过快触发风控 | ❌ 已加节流（分片 ≥400ms、图片 ≥300ms、预取任务间隔 800ms），失败率无明显改善 |
+| WiFi 省电模式吞包 | ✅ 已修：WiFi.setSleep(false)，但连接失败仍在 |
+| TLS 会话被 housekeeping 误关 | ✅ 已修：keep-alive 会话加在途计数，仅在途=0 且闲置 30s 才关 |
+
+### 与 reMarkable 项目的实现对照
+
+| 项目 | 网络栈与调用方式 | 对本问题的意义 |
+|------|------------------|----------------|
+| reMarkable `rm webook` | 完整 Linux 网络栈；Qt 侧用 `iw`/`ip`/`wpa_cli` 管理网络，HTTP 内容请求由 KOReader Lua helper / Linux 系统栈完成 | 网络、DNS、TCP/TLS 资源余量大，单次失败通常不会冻结整个 UI；但本轮未确认它与 PaperS3 走相同出口 |
+| PaperS3 | ESP-IDF 4.4.7 / Arduino-ESP32 2.0.17，lwIP + mbedTLS + `esp_http_client`；普通 API 每次新建/销毁 client，正文分片才复用 `ShardSession` keep-alive | 普通 API 频繁做 DNS/TCP/TLS，新握手慢、暴露故障窗口多；同步调用和叠加重试会直接阻塞 UI |
+
+### 2026-07-18 诊断固件与实机实验
+
+本轮只增加诊断入口，没有修改生产网络策略：`src/network_diag.cpp/.h`，以及 `src/main.cpp` 中两条串口命令。命令均持有 `g_net_mtx`，不会输出 cookie、正文或书架内容。
+
+- `netdiag [N]`：测试 DNS、TCP:443、weread 新建 TLS、`www.qq.com` 对照、新建/复用 TLS 及堆内存。
+- `netapi [N]`：调用现有账户下的 `/web/shelf/sync` 生产请求路径，只打印状态码、响应长度、耗时和内存。
+- PlatformIO 编译通过：RAM 27.5%（89952/327680），Flash 14.2%（1994557/14090240）；诊断固件已成功烧录真机。
+
+| 实验 | 实机结果 | 结论边界 |
+|------|----------|----------|
+| 冷启动基线 | WiFi 信道 9，RSSI 约 -44~-51 dBm，书架成功加载 115 本 | 本轮不支持“单纯信号弱”假设 |
+| `netdiag 10` | weread DNS/TCP 10/10；对照域名 TCP 10/10；weread 新建 TLS 10/10；对照域名新建 TLS 10/10；weread 复用 TLS 10/10 | 本轮没有复现底层网络失败；新建 TLS 约 0.76~2.67s，复用后约 43~72ms，说明连接复用可显著缩短延迟和故障暴露窗口，但不能单独证明根因 |
+| `netapi 20` | 20/20 成功；每次响应 157450 bytes，约 2.16~2.40s | 内部 DRAM 从约 59.7KB 降至约 56.4KB 后稳定，最大块 34KB；未发现持续逐请求泄漏或 socket 耗尽 |
+| 3 本书末段全链路抽测 | 3/3 成功，耗时约 3.0s / 17.4s / 31.2s，相关 TCP/TLS 错误计数为 0 | 含缓存与真实网络混合样本，只能证明当时窗口可用 |
+| 扩展矩阵 | 已完成的两个目标均成功（一个缓存命中 0s，一个约 17.5s），随后按用户要求停止 | 没有出现可用于定位的失败样本 |
+| 下载《伊朗五百年》 | 28 章完成 27 章；新拉取 25 章；固件计时 165s（主机约 168s）；`shard_rebuild`、TCP/TLS/select timeout/software abort/delayed connect 均为 0 | 长连接下载窗口稳定。第 1 章失败属于“非 HTTP 分类”，未取得更细子类型，不能把它直接归为 TCP 失败 |
+| 再次补缺章 | 120s 内没有收到下载完成，设备界面表现为“卡住” | 成功复现用户看到的长时间无响应，但串口重新打开会重置设备，未能在保持现场的情况下取得阻塞栈 |
+| Mac curl 对照 | 20/20 成功，但默认 `remote_ip=127.0.0.1`；禁用显式代理后仍经系统 `utun`/`198.18.0.1` 路由 | 只能证明代理/TUN 路径当时稳定，不能证明 PaperS3 的直连路径稳定 |
+
+### 为什么刚才都成功、后来又卡住
+
+- **这轮没有修复生产网络逻辑。**“后来都成功”主要因为当时网络窗口本身稳定，正文走 keep-alive，而且多次串口重连都重置了设备，清掉了 TCP/TLS/session/堆的运行态；后续缓存命中也减少了真实请求。这些都会暂时降低失败率。
+- macOS 用 pyserial 打开 `/dev/cu.usbmodem2101` 会触发 `rst:0x15 (USB_UART_CHIP_RESET)`，即使设置 `dtr=False` 也会重置。网络问题复现时必须**一次打开串口持续采集**；反复重连会改变现场并掩盖问题。
+- “卡住”的放大机制已经由代码确认：单次 HTTP 超时是 20s；分片请求内部可重试一次（最多约 40s）；一章还会顺序请求 reader、e_0、e_1、e_3；`download_all()` 在失败后又等待 2s 并重试整章。取消只在章节之间检查，无法中断正在执行的 `esp_http_client_perform()`。因此底层只要连续超时，UI 就可能数分钟不响应。
+- 串口重置后设备正常启动，WiFi、书架和阅读恢复均成功，`s` 命令可用；没有看到崩溃 backtrace，也没有删除账户或缓存数据。因此本次“卡住”更符合阻塞等待而非永久死机或数据损坏。
+
+### 当前判断与下一步
+
+- 历史上的 `mbedtls_ssl_setup -0x7F00` 本地 DRAM 问题已经由 PSRAM allocator 修复；本轮未再出现。
+- 尚不能把剩余间歇性 TCP 失败归因到单一因素。当前较可信的方向是：ESP32 的旧版 lwIP/mbedTLS 直连路径，加上普通 API 频繁新建 TLS，放大了偶发路由/TCP/TLS失败；手机热点 A/B 仍是必要的路径对照。
+- 下次真实失败窗口应先保持串口持续打开，依次跑 `netdiag 20`、`netapi 20` 并记录错误类别、耗时和内存，再决定是否重置。
+- 优先修 UI 假死：给整章设总时间预算，取消重复的整章外层重试或统一成单一重试预算，并让取消/心跳能在网络等待过程中生效。
+- 随后把普通 `WereadClient` 改为同 host 连接复用：失败时只重建一次，空闲超时关闭，并保留 `in_use` 防护。
+- 再在相同固件、相同测试命令下做家用 WiFi vs 手机热点 A/B；热点稳定只能说明路径/路由相关，热点同样失败才继续集中查 ESP32 TLS/lwIP。
+
+### 受影响的功能 vs 不受影响
+- **不受影响（全好）**：SD 缓存过的书离线阅读、翻页（0.4-0.9s）、字体、休眠、配网门户、扫码登录、书架（缓存命中时）
+- **受影响**：新书的目录/详情/正文/插图/下载整本/进度上传——网络窗口期可能失败；下载整本等同步长操作还会因叠加重试表现为长时间界面无响应
+
+---
+
+## 一、项目目标
+
+把微信读书 Web 接口移植到 **M5Stack PaperS3**（ESP32-S3 + 4.7 寸墨水屏 ED047TC1，960x540）：
+配网 → 登录 → 书架 → 详情 → 正文 → 墨水屏中文渲染 → 进度同步。
+
+协议蓝本：`ref/weread.koplugin`（KOReader 插件，注意：**上游无明确 LICENSE**，weread_crypto 是其移植）
+固件参考：`ref/M5ReadPaper`、`ref/M5PaperS3-UserDemo`
+发布仓库：https://github.com/nasonliu/papers3-weread （v0.1.0 已发，含 full.bin/app.bin；M5Burner 收录材料已备但官方收录仓库已归档，需论坛求收录）
+
+---
+
+## 二、当前已完成（里程碑）
+
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| 编译/烧录 | ✅ | PlatformIO，Flash 占 ~14% |
+| 配网门户 | ✅ | 无配置/失败自动开 AP + captive 弹窗 + 网页选 WiFi，失败显示中文原因 |
+| 扫码登录 | ✅ | 设备弹 QR 手机扫码；**令牌自动续期**（wr_rt 换 wr_skey，请求层 -2012 自动续+重发，开机主动续，轮换 cookie 定期落盘） |
+| 书架 | ✅ | 封面 5 本/页、最近阅读排序（bookProgress.readUpdateTime）、进度百分比、相邻页封面预取 |
+| 书籍详情 | ✅ | 封面/标题/作者/出版社/简介/热门评论（listType=3）；继续阅读（服务器章级+本地页级）；下载整本（进度条+取消）；**插图开关（按书记忆）** |
+| 正文阅读 | ✅ | 图文混排（文本+图片块游标分页）、原书 h1-h4 样式（h1 2x+仿粗 h2-h4 仿粗）、首行缩进 2 中文字符、段间距 lh/4、版心居中（左右各 30px） |
+| 图片 | ✅ | JPEG/PNG/GIF 解码灰度上屏（TJpg/PNGdec/AnimatedGIF）、SD 缓存、keep-alive 下载、负缓存（会话级）、**插图开关** |
+| 目录屏 | ✅ | 正文左上角进入，翻页/选章/返回 |
+| 快刷翻页 | ✅ | epd_fast 异步推送 ~260ms；字形缓存后翻页 0.4-0.9s；每 8 页全刷清残影 |
+| 进度同步 | ✅ | 上传 POST /web/book/read（koplugin 签名 payload）；本地 SD progress.json；后台任务上传（30s 节流） |
+| 后台任务 | ✅ | net_worker：预取下一章（bookId 校验防脏配对）、相邻页封面、本章插图、进度上传；g_net_mtx 递归锁 |
+| 休眠 | ✅ | 浅睡（书架"睡眠"/闲置 5min，充电中不睡）+ 摸屏秒醒原地续跑；电源键硬重启自动恢复阅读页（state.json 每次翻页更新） |
+| 字体 | ✅ | 双字体（UI 固定霞鹜文楷 / 正文可换）；字体页逐字体预览+整屏缓存；换字体即重排 |
+| 缓存 | ✅ | 按书分目录 `/weread/cache/<bookId>/`（toc.json/detail.json/ch_uid.blk），B7 格式（含 style） |
+| 测试 | ✅ | `test_matrix.py` 全流程矩阵（详情/目录/选章/打开/翻页/下载整本计时） |
+
+---
+
+## 三、硬件引脚（PaperS3）
+
+- SD（SPI）：CS=47 SCK=39 MOSI=38 MISO=40
+- 屏幕：物理 960x540，竖屏逻辑 540x960；M5GFX 自动识别 board_M5PaperS3
+- 串口：/dev/cu.usbmodem2101 @115200
+- 电源键：**软件不可读**（接 PMS150G 电源管理芯片，原理图+社区三方实证）；GPIO44 脉冲可主动断电；休眠只能用浅睡+触摸唤醒或断电+状态恢复
+- USB 检测：GPIO5(USB_DET) **浮空不可靠**（实测恒读 0），充电检测用 `M5.Power.isCharging()`（GPIO4 CHG_STAT）
+
+---
+
+## 四、中文字体（双字体架构）
+
+- **UI 字体** `g_ui_font`：固定 `/font/霞鹜文楷_大.bin`，菜单永不缺字
+- **正文字体** `g_read_font`：配置项 `font`，阅读页内切换，切换即重排；加载失败回滚文楷
+- 渲染核心 `drawTextFontScaled(font,...,scale)`（scale 1/2 放大）；`drawUI/drawRead/drawReadStyle`；仿粗体 = x+1 二次绘制
+- **EdcFont::load 重载必须清空 entries_ 和字形缓存**（否则换字体无效）
+- **SD `e.name()` 只返回裸文件名**（不带目录），拼路径必须自己加 `/font/` 前缀
+- 字形解码缓存 1.5MB PSRAM（翻页提速主因：600 字/页 × 4ms SD 读 → 命中免读）
+- 灰度映射：`0=黑..15=白`，直接 `v=g*255/15`，**不要反转**
+
+---
+
+## 五、微信读书接口（关键）
+
+### 接口清单（全部实测，走 weread.qq.com/web/*，cookie 明文）
+| 功能 | 方法 | URL |
+|------|------|-----|
+| 书架+进度 | GET | `/web/shelf/sync`（books[] + bookProgress[]） |
+| 目录 | POST | `/web/book/chapterInfos` |
+| 详情 | GET | `/web/book/info?bookId=`（无作者简介字段） |
+| 评论 | GET | `/web/review/list?listType=3`（推荐长评；1=好友流 2=最新） |
+| 进度上传 | POST | `/web/book/read`（koplugin 全套签名：appId/b/c/ci/co/sm/pr/rt/ts/rn/sg/ct/ps/pc+s） |
+| 正文 | reader HTML 取 psvts → POST `/web/book/chapter/e_0/e_1/e_3`（epub）或 `t_0/t_1`（txt） |
+| 续期 | POST | `/web/login/renewal`（body `{"rq":"%2Fweb%2Fbook%2Fread","ql":false}`） |
+| 图片 | CDN 直链（cdn/res.weread.qq.com、myqcloud）；res.weread 需 cookie（401→302 签名 CDN） |
+
+### 关键规则
+- ❌ `i.weread.qq.com/*` 要额外签名（401），新接口全走 web 域名
+- **-2012 字段名有 errcode/errCode 两种**（实测是驼峰），filter 里两个都要留
+- **cookie 会被服务器轮换**：absorbSetCookie 检测变化置脏，主循环 60s 写回；wr_skey 短效（几小时）靠 wr_rt 续期
+- **正文 `../Images/*` 相对图是 Web 阅读器 UI 装饰图**（tar 包里没有），跳过；CDN 绝对图才是插图
+- **分片禁止用 String 持有**（单片可超 64KB 必失真），HTTP 接收→解码全程 PSRAM 指针（steal_response_data 零复制）
+
+### ⚠️ swap 解码算法（血泪教训）
+原算法（weread.lua）：`tonumber(bin(byte), 4)` = **bit 展开**（第 b 位 → 4^b = 2^(2b)）。曾错写成"2 位二进制转一个四进制数字拼接"，导致每章几字节错位（正文看不出，URL 被砸中就 404）。正确实现：`val += 1U << (2*b)`。Mac 侧用同一章真实分片验证过两种实现逐字节差异。
+
+---
+
+## 六、EPD 刷新与触摸架构（M5GFX 0.2.20）
+
+- `epd_quality`(~31帧,16灰,有消影,~1.7s) / `epd_text`（同帧数别用） / `epd_fast`(~9帧,1bit,无消影,~650ms,翻页首选) / `epd_fastest`(~6帧)
+- `setEpdMode` 必须在 `pushSprite` 之前调；pushSprite 自动异步刷新，别再调 display()；`waitDisplay` 等波形播完
+- fast 无消影 → 每 8 页一次 quality 全刷
+- **触摸：独立任务 10ms 采集**（GT911 超 128ms 不读丢数据），wasPressed 落指入队；坐标随 rotation 自动映射 540x960；跨屏 xQueueReset
+- 0.2.20 的 display(x,y,w,h) 窗口不做旋转换算且不省时，只用无参刷新
+
+---
+
+## 七、休眠与恢复
+
+- **浅睡**（主路径）：`M5.Power.lightSleep(0,true)`（GPIO48 触摸 INT 唤醒），EPD 断电图像保持；醒后 `M5.Display.wakeup()` + WiFi 重连 + NTP 重校时 + 重绘当前屏
+- **断电恢复**：每次翻页写 `/weread/state.json`（bookId/c/p/title/cover/format），开机 `try_restore_reading()` 优先走 TOC/正文缓存秒回阅读页（不依赖书架）；显式回书架时删除标记
+- **浅睡时主循环冻结**：定时器类逻辑（续期/落盘）不会跑，无唤醒耗电问题
+- 闲置 5 分钟自动浅睡；**充电中（isCharging）不睡**
+
+---
+
+## 八、多任务与内存规则（连环崩溃的教训）
+
+- **net_worker**（prio 1, stack 12K）：预取下一章（PrefetchJob 带 bookId 校验）/相邻页封面/本章插图/上传进度；与主任务共用 ShardSession/img 会话/psvts 缓存/g_blocks → **所有 weread_api/img_render 调用必须持 g_net_mtx 递归锁**
+- **keep-alive 会话都有在途计数（in_use）**：housekeeping（主循环 5s）只在 in_use==0 且闲置 30s 才关——**曾经因为在途关句柄导致伊朗五百年预取崩溃循环**（addr2line 实锤）
+- **进度屏只许主任务画**（g_stage_ui_ok 门）：曾两任务共画画布崩溃
+- **mbedTLS 分配走 PSRAM**（platform_set_calloc_free，否则 DRAM 满 → -0x7F00 → 请求发不出）
+- 大缓冲一律 PSRAM；String 超 64KB 会坏（大章 xhtml/解码全程 PSRAM，单文本块 ≤48KB）
+
+---
+
+## 九、缓存与测试
+
+### SD 目录
+```
+/font/*.bin                    字体（EDCBook，UI 必需霞鹜文楷_大）
+/weread/config.json            WiFi+cookie+font
+/weread/progress.json          各书页级进度
+/weread/state.json             上次阅读位置（重启/断电恢复）
+/weread/imgoff.json            各书插图开关
+/weread/cache/<bookId>/toc.json / detail.json / ch_<uid>.blk（B7）
+/weread/img/                   封面插图缓存（md5 命名 + 会话负缓存）
+```
+
+### 串口命令（115200）
+`n/p`翻页 `s`书架 `sp/sm`书架翻页 `t`目录屏 `tp/tm`目录翻页 `ts N`选章 `N`详情 `N:C`直读 `dl`下载整本 `wifi`配网 `login`扫码 `imgs`图片URL `fonts`字体自检 `books`打印书架 `usb`充电诊断 `imgoff`插图开关 `netdiag [N]`分层网络诊断 `netapi [N]`生产 API 重复诊断 `CFG {json}`写配置
+
+> 调试注意：macOS 打开 `/dev/cu.usbmodem2101` 会触发 `USB_UART_CHIP_RESET`。取间歇性故障证据时应一次打开并持续记录，不要反复关闭/重开串口。诊断命令不输出 cookie 或正文。
+
+### 测试脚本
+`test_matrix.py`：就绪→书单→（详情/目录屏/选章打开计时/翻页×5计时/插图统计）×5 本书→下载整本计时→汇总。设备必须已开机联网。
+
+---
+
+## 十、遗留问题（按优先级）
+
+1. **【P0 已定位机制】同步网络叠加重试造成界面长时间“卡住”**（见第〇节）——整章总超时、单一重试预算、等待过程可取消/有心跳
+2. **【P0 底层根因未解】ESP32↔weread 间歇性 TCP 连接失败**——失败现场连续串口取证 + 家用 WiFi/手机热点同固件 A/B
+3. **【P1 降低暴露窗口】普通 WereadClient 同 host 连接复用**——失败重建一次、空闲关闭、保留 in_use 防护
+4. 插图多的章节下载慢（已缓解：imgoff 开关 + 后台懒加载 + 8s 超时 + 会话负缓存）
+5. 个别小 PNG（weread 装饰图）PNGdec rc=7 拒画 → [图片] 占位，不影响正文
+6. strip_xhtml 不去 <style> 块：epub 版权页前几页可能露一小段 CSS 文本
+7. weread.koplugin 无上游 LICENSE，weread_crypto 是其移植——公开发布的法律注意项（REweread 项目同款问题，其处理是只发非协议代码）
+8. M5Burner 官方收录仓库已归档只读，需 M5Stack 论坛求收录（m5burner.json+firmware/ 材料已备）
+9. 简介/热门评论缓存已有；详情页剩余 ~4s 在线等待来自这两个接口（可再做后台刷新）
+
+---
+
+## 十一、快速恢复清单
+
+1. 烧录异常/崩溃循环救砖：长按电源键进下载模式（红灯闪）再 pio upload
+2. 编译卡死 → 删 `.pio/build/PaperS3/.sconsign*.dblite`
+3. 登录态问题 → 先用 `netapi 1` 看 HTTP/接口结果；不要在日志或交接中导出 cookie，服务器轮换值以设备落盘状态为准
+4. 目录/正文错乱（书对不上章）→ 清 `/weread/cache/` 对应 bookId 目录（脏配对历史坑，现有四层防护）
+5. 屏幕字发虚 → 检查灰度映射回潮（g=0 应纯黑）
+6. 点按没反应/连翻 → 检查触摸任务与阻塞刷新（翻页必须 epd_flush_async）
+7. 文字全不显示 → 检查 UI 文字是否误绑 g_read_font
+8. 换字体无效 → 检查 EdcFont::load 是否清空 entries_ + 字体路径是否带 /font/ 前缀
+
+---
+
+## 十二、交接速览（给下一个 agent）
+
+**一句话现状**：产品形态完整可用并已发布（v0.1.0）；本轮分层诊断与长书下载大部分成功，仍没有抓到间歇性 TCP 失败的有效现场，不能宣称网络已修好；但已确认同步超时和双层重试会把偶发失败放大成数分钟界面无响应，应该先修这一 P0 体验与可恢复性问题。
+
+**上手顺序**：
+1. 读本文档第〇节（最大难点）+ 第五节（接口规则）+ 第八节（多任务内存规则，连环坑都在这）
+2. 串口一次打开后持续记录；先发 `netdiag 20`、`netapi 20` 建立分层基线，不要反复重连导致设备重置
+3. 复现网络问题：开没缓存的章节或下载长书；卡住时先记录时间、当前阶段和错误类别，能保持现场就不要先重置
+4. 用同一版固件/命令做家用 WiFi 与手机热点 A/B；不要再把走代理/TUN 的 Mac 当作同路径对照
+5. 别踩的坑：HttpResponse 必须用 data()/length()、swap 是 bit 展开、load 清缓存、会话看在途计数、SD e.name() 是裸名
+
+**关键文件**：
+- `src/main.cpp` — 全部 UI/启动流程/触摸/分页/缓存/休眠（最大文件，~1900 行）
+- `src/weread_api.cpp` — 接口层（ShardSession keep-alive + PSRAM 管线 + psvts 缓存）
+- `src/weread_crypto.cpp` — 签名/解码（PSRAM 版 + swap bit 展开）
+- `src/img_render.cpp` — 图片三格式下载/解码/灰度上屏
+- `src/provision.cpp` / `src/weread_login.cpp` — 配网/登录
+- `src/network_diag.cpp/.h` — DNS/TCP/TLS/生产 API 分层诊断（不输出账户和内容）
+- `test_matrix.py` — 全流程测试矩阵
+
 
 ---
 

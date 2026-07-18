@@ -24,6 +24,7 @@
 #include "boot_logo.h"
 #include "provision.h"
 #include "weread_login.h"
+#include "network_diag.h"
 // qrcodegen 的枚举 Ecc::LOW/HIGH 与 Arduino 的 LOW/HIGH 宏冲突，包含前先 undef
 #undef LOW
 #undef HIGH
@@ -1435,8 +1436,8 @@ static void render_toc() {
     String pg = String(g_toc_page + 1) + "/" + String(total_pages);
     drawUI(pg, (SCREEN_W - textWidthUI(pg)) / 2, SCREEN_H - 44);
     drawUI("下一页", SCREEN_W - 24 - textWidthUI("下一页"), SCREEN_H - 44);
-    epd_flush(epd_mode_t::epd_quality);
-    if (g_touch_q) xQueueReset(g_touch_q);
+    epd_flush_async(epd_mode_t::epd_fast); // 菜单页用快刷+不阻塞：翻目录时保持点按响应
+    // 不重置触摸队列：渲染期间点的会排队补处理（长目录翻页不再"点了没反应"）
 }
 
 static void show_toc() {
@@ -1444,6 +1445,7 @@ static void show_toc() {
     g_toc_page = g_ch_idx / toc_per_page(); // 跳到当前章所在页
     g_screen = SCR_TOC;
     render_toc();
+    if (g_touch_q) xQueueReset(g_touch_q); // 仅进入时清一次（防上个界面的残留点按）
 }
 
 static void handle_toc_touch(int x, int y) {
@@ -1790,6 +1792,22 @@ void loop() {
         if (line == "sm") { g_shelf_page--; show_shelf(); return; }  // 书架上一页
         if (line == "wifi") { run_provisioning_portal(screen_msg, ""); return; } // 进配网门户
         if (line == "login") { shelf_relogin(); return; }                        // 进扫码登录
+        if (line.startsWith("netdiag")) { // 分层网络诊断：不发 cookie，不打印用户内容
+            int rounds = line.substring(7).toInt();
+            if (rounds <= 0) rounds = 6;
+            net_lock();
+            network_diag::run((unsigned)rounds);
+            net_unlock();
+            return;
+        }
+        if (line.startsWith("netapi")) { // 生产 API 路径压测：发现有 cookie 但只输出脱敏统计
+            int rounds = line.substring(6).toInt();
+            if (rounds <= 0) rounds = 10;
+            net_lock();
+            network_diag::run_api((unsigned)rounds);
+            net_unlock();
+            return;
+        }
         if (line == "cookie") { // 导出当前 cookie（调试用，供电脑端脚本测试接口）
             Serial.printf("COOKIE wr_vid=%s wr_skey=%s wr_rt=%s\n",
                           WR.getCookie("wr_vid").c_str(), WR.getCookie("wr_skey").c_str(), WR.getCookie("wr_rt").c_str());
