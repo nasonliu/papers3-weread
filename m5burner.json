@@ -1,6 +1,6 @@
 {
     "name": "PaperS3 微信读书",
-    "description": "M5Stack PaperS3 微信读书墨水屏阅读器：配网门户、扫码登录、封面书架、图文混排、快刷翻页、进度云同步、字体切换、浅睡唤醒。全程不需要电脑。",
+    "description": "PaperS3 上的微信读书墨水屏阅读器：配网/扫码登录全自动，封面书架、图文混排、快刷翻页、进度云同步、字体切换、休眠显示封面。⚠️需TF卡放字体：到 github.com/nasonliu/papers3-weread 的 Release 下载 papers3-fonts.zip，解压把 font/ 拷到卡根目录（必需 霞鹜文楷_大.bin）。",
     "keywords": "PaperS3, ESP32-S3, e-paper, weread, reader, 微信读书",
     "author": "nasonliu",
     "repository": "https://github.com/nasonliu/papers3-weread",
@@ -8,7 +8,9 @@
         {
             "PaperS3": {
                 "path": "firmware",
-                "device": ["M5Stack PaperS3"],
+                "device": [
+                    "M5Stack PaperS3"
+                ],
                 "default_baud": 921600
             }
         }
