@@ -19,12 +19,17 @@ TF 卡根目录/
 ```
 
 **字体从哪来**（任选）：
-- **GitHub 直接下载**（推荐）：见本仓库 Release 的 `fonts/` 资源
+- **GitHub 直接下载**（推荐）：Release 里的 [`papers3-fonts.zip`](https://github.com/nasonliu/papers3-weread/releases/download/v0.2.0/papers3-fonts.zip)
+  （60MB，含必需的 `霞鹜文楷_大.bin` + 13 款可选字体 + `EDCBook_FontTool_1.1.py` 转换工具，解压后把 `font/` 整个拷到 TF 卡根目录）
 - 从 EDC Book 阅读器的 TF 卡直接拷（同格式通用）
+- 自己用 TTF 转换：跑 `EDCBook_FontTool_1.1.py`（包里有，用法见 字体使用说明）
 
 字体是 EDCBook 点阵格式（.bin），**UI 固定用 `霞鹜文楷_大.bin`**，必须有；
 其余字体可选（霞鹜文楷30/36、霞鹜新晰黑、霞鹜新致宋、思源宋体、仓耳今楷、汉仪空山楷等，
 文件名带字号数字，阅读页内可实时切换）。
+
+> 字体出处：霞鹜文楷（LXGW WenKai, OFL）、思源宋体（Source Han Serif, OFL）等开源字体的 EDCBook 点阵转换版，
+> 社区整理（EDCBook/梦西游啊游/Angry_40/科技玩家LAzySheep），仅作个人阅读设备使用。
 
 ## 3. 烧录固件
 
