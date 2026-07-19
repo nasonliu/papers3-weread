@@ -18,6 +18,7 @@
 #include "storage.h"        // storage_sd_ok() / SD_WEREAD_DIR
 #include "weread_crypto.h"  // weread::md5_hex()
 #include "weread_client.h"  // WR.cookieHeader()（需鉴权图源重试用）
+#include <WiFi.h>           // WiFi.status()（网络断开时跳过下载）
 #include <SD.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
@@ -82,6 +83,8 @@ static String g_img_host;
 static char g_img_host_buf[96]; // cfg.host 用持久缓冲（esp_http_client 不复制该指针，局部 String 会悬垂！）
 static unsigned long g_img_last_use = 0; // 最近使用时间（闲置关闭用）
 static volatile int g_img_in_use = 0;    // 在途计数（housekeeping 只在 0 时关，否则关掉在途句柄必崩）
+static int g_consec_fail = 0;            // 连续失败计数（熔断用）
+static unsigned long g_breaker_until = 0; // 熔断截止时间：连续失败 3 次后 60s 内不再尝试（防重试风暴卡死主循环）
 
 static void img_client_drop() {
     if (g_img_client) {
@@ -93,7 +96,9 @@ static void img_client_drop() {
 
 // 精简 HTTPS GET：成功返回接收字节数，失败/超限/非 200 返回 0
 // with_cookie=true 时带 weread cookie（res.weread.qq.com 等需鉴权的图源用）
-static size_t https_get(const String& url, uint8_t* buf, size_t cap, bool with_cookie) {
+// fail_kind_out（可空）：1=连接级失败（DNS/建连），2=HTTP 层失败（4xx/5xx）
+static size_t https_get(const String& url, uint8_t* buf, size_t cap, bool with_cookie, int* fail_kind_out = nullptr) {
+    if (fail_kind_out) *fail_kind_out = 0;
     // 从 URL 提取 host（keep-alive 按 host 复用会话）
     int hs = url.indexOf("://");
     int he = url.indexOf('/', hs + 3);
@@ -141,11 +146,13 @@ static size_t https_get(const String& url, uint8_t* buf, size_t cap, bool with_c
         int status = esp_http_client_get_status_code(g_img_client);
         if (err != ESP_OK) {
             // 连接级失败（含空闲被服务端断开）：丢弃会话重建重试一次
+            if (fail_kind_out) *fail_kind_out = 1;
             Serial.printf("[img] 连接失败，重建重试 err=%s url=%.60s\n", esp_err_to_name(err), url.c_str());
             img_client_drop();
             continue;
         }
         if (ib.overflow || status != 200 || ib.len == 0) {
+            if (fail_kind_out) *fail_kind_out = 2;
             Serial.printf("[img] 下载失败 status=%d len=%u%s url=%.80s\n",
                           status, (unsigned)ib.len, ib.overflow ? " (>上限)" : "", url.c_str());
             return 0; // HTTP 层失败是会话正常应答，不重建
@@ -223,17 +230,29 @@ String fetch(const String& url) {
     if (hit.length()) return hit;
     // 会话级负缓存：本次开机失败过的不再反复试（重启即清空，给瞬时失败第二次机会）
     if (g_fail_set.count(base)) return "";
+    // 熔断：连续失败 3 次后 60s 内不再尝试下载（网络挂时防重试风暴卡死主循环）
+    if (millis() < g_breaker_until) return "";
+    // 网络都没连上就别下了（DNS 必败，省 15 秒/张）
+    if (WiFi.status() != WL_CONNECTED) { g_fail_set.insert(base); return ""; }
 
-    // 2) 下载到 PSRAM（裸取失败用 weread cookie 重试：res.weread.qq.com 插图需鉴权）
+    // 2) 下载到 PSRAM（裸取失败用 weread cookie 重试：res.weread.qq.com 插图需鉴权；连接级失败不重试）
     uint8_t* buf = (uint8_t*)heap_caps_malloc(IMG_MAX_BYTES, MALLOC_CAP_SPIRAM);
     if (!buf) { Serial.println("[img] PSRAM 分配失败（下载缓冲）"); return ""; }
-    size_t n = https_get(url, buf, IMG_MAX_BYTES, false);
-    if (n == 0) n = https_get(url, buf, IMG_MAX_BYTES, true);
+    int kind = 0;
+    size_t n = https_get(url, buf, IMG_MAX_BYTES, false, &kind);
+    if (n == 0 && kind == 2) n = https_get(url, buf, IMG_MAX_BYTES, true, &kind); // 仅 HTTP 层失败才用 cookie 重试
     if (n < 8) {  // 过短不可能是有效图片（也保证下面读前 4 字节安全）
         heap_caps_free(buf);
         g_fail_set.insert(base); // 记负缓存（仅本次开机有效）
+        // 熔断计数：连续 3 次失败熔断 60s
+        if (++g_consec_fail >= 3) {
+            g_consec_fail = 0;
+            g_breaker_until = millis() + 60000;
+            Serial.println("[img] 连续失败 3 次，熔断 60s 暂停下载（防卡死）");
+        }
         return "";
     }
+    g_consec_fail = 0; // 成功一次就解除熔断计数
 
     // 3) magic bytes 定扩展名；非 jpeg/png 丢弃
     int fmt = img_format(buf, n);
