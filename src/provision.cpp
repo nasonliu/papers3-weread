@@ -245,9 +245,10 @@ void run_provisioning_portal(void (*ui)(const String&, const String&, const Stri
     }
     g_ui("配网模式", "热点: PaperS3-阅读器", "浏览器打开 192.168.4.1");
 
-    WiFi.disconnect();           // 停掉 STA 侧残留的连接尝试（否则 AP 的 DHCP 可能起不来）
+    WiFi.disconnect(true);       // 停掉 STA 侧残留的连接尝试（否则 AP 的 DHCP 可能起不来）
     WiFi.mode(WIFI_AP_STA);
-    delay(100);
+    WiFi.enableAP(true);         // 干净启动时 WiFi 从未初始化过，不显式使能 AP 侧 softAP() 会返回 false（"enable AP first!"）
+    delay(200);
     // 显式配置 AP 网段并给 dhcpd 启动时间，避免客户端拿不到地址（自分配 169.254.x.x）
     WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
     bool ap_ok = WiFi.softAP("PaperS3-阅读器"); // 开放热点，无密码

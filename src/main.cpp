@@ -15,6 +15,7 @@
 #include <time.h>
 #include <mbedtls/platform.h>
 #include <esp_heap_caps.h>
+#include <nvs_flash.h>
 #include "config.h"
 #include "storage.h"
 #include "weread_client.h"
@@ -1608,6 +1609,16 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== PaperS3 微信读书 ===");
+    // NVS 自愈：损坏/未初始化时擦除重建（否则 esp_wifi_init 报 4353，热点和联网全废）
+    {
+        esp_err_t nerr = nvs_flash_init();
+        if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            Serial.printf("[nvs] 初始化失败(%d)，擦除重建\n", (int)nerr);
+            nvs_flash_erase();
+            nerr = nvs_flash_init();
+        }
+        Serial.printf("[nvs] init=%d\n", (int)nerr);
+    }
     weread_api::chapter_stage_cb = chapter_stage_ui; // 拉正文进度打点 → 屏幕进度条
 
     // mbedTLS 内存分配改走 PSRAM（DRAM 长期近满导致 mbedtls_ssl_setup -0x7F00，
@@ -1686,14 +1697,14 @@ void setup() {
     }
     show_splash(); // 唯一一次首屏：图标+标题（字体已就绪）
 
-    // ---- WiFi 配置检查：无配置给 5 秒串口 CFG 窗口（首屏保持），然后进配网门户 ----
-    bool have_cfg = WR.wifi_ssid.length() && WR.hasValidCookie();
+    // ---- WiFi 配置检查：只判 WiFi 是否配置（未登录走后面的扫码流程，不该回配网） ----
+    bool have_cfg = WR.wifi_ssid.length() > 0;
     if (!have_cfg) {
-        Serial.println("[提示] 无有效配置，5 秒内可串口发 CFG {...}");
+        Serial.println("[提示] 未配置 WiFi，5 秒内可串口发 CFG {...}");
         unsigned long t0 = millis();
         bool got = false;
         while (millis() - t0 < 5000) {
-            if (try_serial_config() && WR.wifi_ssid.length() && WR.hasValidCookie()) {
+            if (try_serial_config() && WR.wifi_ssid.length()) {
                 got = true; break;
             }
             delay(50);
@@ -1709,6 +1720,16 @@ void setup() {
         run_provisioning_portal(screen_msg, "连接超时/密码错误"); // 永不返回（成功后重启）
     }
     configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // 校时（进度上传签名用 ts）
+
+    // 无登录态 → 直接扫码登录（有 WiFi 配置就不该回配网门户）
+    if (!WR.hasValidCookie()) {
+        Serial.println("[login] 无登录态，进入扫码登录");
+        if (!do_qr_login()) {
+            screen_msg("登录未完成", "点按屏幕重启");
+            wait_tap(600000);
+            ESP.restart();
+        }
+    }
 
     // 主动续期：wr_skey 是短效令牌（几小时过期），有 wr_rt 就能换新，不用天天扫码
     if (WR.hasValidCookie()) {
@@ -1835,6 +1856,15 @@ void loop() {
             book_img_off_set(g_cur_book.bookId, now);
             Serial.printf("[img] 插图开关 → %s\n", now ? "关" : "开");
             if (g_screen == SCR_READING && !g_pages.empty()) render_page(epd_mode_t::epd_quality, true);
+            return;
+        }
+        if (line == "wipe") { // 清掉登录态与阅读状态（还原干净机器，测首次开机用）
+            if (storage_sd_ok()) {
+                SD.remove("/weread/config.json");
+                SD.remove("/weread/state.json");
+                SD.remove("/weread/progress.json");
+            }
+            Serial.println("[wipe] 已清除 config/state/progress，重启后进配网门户");
             return;
         }
         if (line == "imgs") { // 导出当前章图片块 URL（图片问题调试用）
