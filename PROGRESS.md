@@ -937,3 +937,13 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 - 计时插桩法：怀疑哪里慢就在哪里打 `[t]` 毫秒点，一轮就能分层（本轮封面 open/decode/blit 三层全靠它拆开）
 
 **版本**：m5burner.json → 0.2.5；发布物只有整片 `papers3-weread-full.bin`（keep 参数合并，头部 DIO 已验）。
+
+### 同日追加：目录获取失败（chapterInfos）三重根因
+
+用户报"所有书目录获取失败"。curl 对照实验 + netdiag 定位出三个独立问题：
+
+1. **WiFi 中途掉线无人管**：netdiag 显示 `wifi=down`，断网后只有重启/浅睡唤醒才重连，期间一切请求 `HTTP -1`（传输失败）。→ loop() 加 WiFi 看门狗：断网 10s 后异步 `WiFi.begin` 重连，30s 一次不阻塞主循环，恢复后重新校时。
+2. **续期防抖初始值 bug**：`last_renew_fail_` 初值 0，`millis() - 0 > 600000` 在开机前 10 分钟恒 false——**开机 10 分钟内 -2012 永远不会自动续期**。改为 `!last_renew_fail_ || ...`。
+3. **续期失败不分类型**：断网导致的 renewal 失败和 wr_rt 真死同等对待，一律 10 分钟冻结续期 → 用户看到的"一直失败"。现在：传输失败 30s 后可再试；服务器拒绝才置 `rt_dead_`（10 分钟防抖）。**wr_rt 死亡时详情页直接引导扫码登录**（`登录已过期，点按屏幕扫码登录`），登录成功自动重试进详情。
+
+另：getChapterInfos 显式识别 -2012（之前报"无 data[]"误导）；curl 对照法再次证明好用——服务器响应在 Mac 上能复现就先别怀疑设备。

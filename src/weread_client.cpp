@@ -156,6 +156,7 @@ bool WereadClient::connectWiFi(unsigned long timeout_ms) {
 
 void WereadClient::setCookie(const String& name, const String& value) {
     if (value.length()) cookies_[name] = value;
+    if (name == "wr_rt") rt_dead_ = false; // 新 rt 到手（扫码登录/服务器轮换）即复活
 }
 
 String WereadClient::getCookie(const String& name) const {
@@ -302,15 +303,16 @@ HttpResponse WereadClient::request(const String& method, const String& url, cons
 
     // 自动续期：wr_skey 短效（几小时过期），任何请求吃到 -2012 就用 wr_rt 续期并重试一次。
     // 只在响应小（错误页都几十字节）且含 -2012 时触发；renewal 自身/近期续期失败不触发（防抖）。
+    // 防抖时长由 tryRenew 按失败类型设置（传输失败 30s，rt 死亡 10 分钟）；
+    // last_renew_fail_ 为 0 表示从未失败过——开机首次 -2012 必须放行（旧代码此处有 bug，开机 10 分钟内不续期）
     if (resp.ok() && !renewing_ && hasValidCookie() && resp.length() < 2048 &&
         memmem(resp.data(), resp.length(), "-2012", 5) != nullptr) {
-        if (millis() - last_renew_fail_ > 600000) { // 续期失败 10 分钟内不再试（防每个请求翻倍）
+        if (!last_renew_fail_ || millis() - last_renew_fail_ > 600000) {
             Serial.println("[cookie] 请求返回 -2012，自动续期并重试");
             if (tryRenew()) { // tryRenew 内部自置 renewing_ 防递归
                 resp = do_once(method, url, body, referer, contentType); // 新 cookie 重发
-            } else {
-                last_renew_fail_ = millis();
             }
+            // 失败防抖时间戳由 tryRenew 按失败类型自设，这里不覆盖
         }
     }
     return resp;
@@ -325,14 +327,15 @@ HttpResponse WereadClient::postJson(const String& url, const String& jsonBody, c
 }
 
 // 续期：wr_skey 是短效令牌（几小时过期），用 wr_rt 调 renewal 换新；成功返回 true 并落盘
-// 服务器返回 {"succ":1,...} 或 {"errcode":-2012,...}（refresh token 也死了 → 只能重扫）
+// 失败分两类：传输失败（网络问题，30s 后可再试）/ 服务器拒绝（wr_rt 已死，置 rt_dead_ 只能重扫码）
 bool WereadClient::tryRenew() {
     renewing_ = true; // 防 request 层对 renewal 响应再触发自动续期（递归）
     String body = "{\"rq\":\"%2Fweb%2Fbook%2Fread\",\"ql\":false}";
     HttpResponse r = postJson(String(WEREAD_HOST_WEB) + "/web/login/renewal", body);
     renewing_ = false;
     if (!r.ok()) {
-        Serial.printf("[cookie] renewal HTTP 失败 status=%d err=%s\n", r.status, r.error.c_str());
+        Serial.printf("[cookie] renewal 传输失败 status=%d err=%s（30s 后可再试）\n", r.status, r.error.c_str());
+        last_renew_fail_ = millis() - 570000; // 相当于 30s 后解除防抖（600s-570s）
         return false;
     }
     // 解析响应：errcode 非 0 / 无 succ 即失败（r 可能是 PSRAM，用 data()/length()）
@@ -343,7 +346,9 @@ bool WereadClient::tryRenew() {
         succ = doc["succ"] | 0;
     }
     if (ec != 0 || !succ) {
-        Serial.printf("[cookie] renewal 失败 errcode=%d（wr_rt 已失效，需重新扫码）\n", ec);
+        Serial.printf("[cookie] renewal 被拒 errcode=%d（wr_rt 已失效，需重新扫码）\n", ec);
+        last_renew_fail_ = millis(); // rt 死亡：10 分钟防抖（防每个请求翻倍）
+        rt_dead_ = true;
         return false;
     }
     // 新 wr_skey 已由 absorbSetCookie 吸收进内存，落盘

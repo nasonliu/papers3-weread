@@ -162,7 +162,9 @@ bool getChapterInfos(const String& bookId, std::vector<ChapterEntry>& out, Strin
     PsramJsonDocument doc(64 * 1024);
     if (deserializeJson(doc, r.data(), r.length())) { err = "chapterInfos JSON 解析失败"; return false; }
 
-    // 兼容 data[] / 顶层
+    // 兼容 data[] / 顶层；先识别 -2012（服务器拒会话，报"登录过期"而非"无 data[]"）
+    int ec = doc["errcode"] | doc["errCode"] | 0;
+    if (ec == -2012) { err = "cookie 过期(-2012)"; return false; }
     JsonArray data;
     if (doc["data"].is<JsonArray>()) data = doc["data"].as<JsonArray>();
     else { err = "chapterInfos 无 data[]"; return false; }

@@ -42,6 +42,8 @@ public:
     // cookie 被服务器轮换后置脏，主循环定期落盘（否则重启后旧 cookie 失效要重扫）
     bool cookiesDirty() const { return cookies_dirty_; }
     void clearCookiesDirty() { cookies_dirty_ = false; }
+    // wr_rt 已被服务器判死（renewal 返回 -2012）：只能重新扫码登录
+    bool rtDead() const { return rt_dead_; }
 
     // 通用请求（自动带 cookie、UA、referer）
     HttpResponse get(const String& url, const String& referer = "https://weread.qq.com/");
@@ -56,7 +58,8 @@ private:
     std::map<String,String> cookies_;
     bool cookies_dirty_ = false;    // wr_skey/wr_rt 被 set-cookie 轮换后置真
     bool renewing_ = false;         // tryRenew 进行中（防 request 层自动续期递归）
-    unsigned long last_renew_fail_ = 0; // 上次续期失败时间（10 分钟防抖）
+    bool rt_dead_ = false;          // renewal 被服务器拒绝（wr_rt 已死，只能重扫码）
+    unsigned long last_renew_fail_ = 0; // 上次续期失败时间（传输失败 30s、rt 死亡 10 分钟防抖）
     HttpResponse request(const String& method, const String& url, const String* body, const String& referer, const String& contentType);
     void absorbSetCookie(const HttpResponse& resp);
 };

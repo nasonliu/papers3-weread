@@ -872,7 +872,16 @@ static void open_book_detail(int shelf_idx) {
     }
 
     if (!fetch_toc(b.bookId, err)) {
-        screen_msg("目录获取失败", err); Serial.println("[错误] 目录: " + err);
+        Serial.println("[错误] 目录: " + err);
+        if (err.indexOf("-2012") >= 0 && WR.rtDead()) {
+            // wr_rt 已被服务器判死，续期无路，引导扫码重登后重试进详情
+            screen_msg("登录已过期", "点按屏幕扫码登录");
+            wait_tap(60000);
+            if (do_qr_login()) open_book_detail(shelf_idx);
+            else show_shelf();
+            return;
+        }
+        screen_msg("目录获取失败", err);
         if (g_touch_q) xQueueReset(g_touch_q);
         return;
     }
@@ -1996,6 +2005,23 @@ void loop() {
         WR.saveCookiesToConfig();
         WR.clearCookiesDirty();
         Serial.println("[cfg] 轮换 cookie 已写回");
+    }
+
+    // WiFi 掉线看门狗：中途断网（路由器重启/漫游/弱信号）之前只能等重启或浅睡唤醒才重连，
+    // 设备会一直"假死"——所有请求传输失败。检测到断网 10s 后异步重连，30s 一次，不阻塞主循环。
+    static unsigned long wifi_down_since = 0, wifi_retry_at = 0;
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!wifi_down_since) wifi_down_since = millis();
+        if (millis() - wifi_down_since > 10000 && millis() > wifi_retry_at) {
+            wifi_retry_at = millis() + 30000;
+            Serial.println("[wifi] 掉线超 10s，自动重连");
+            WiFi.disconnect(false);
+            WiFi.begin(WR.wifi_ssid.c_str(), WR.wifi_pass.c_str());
+        }
+    } else if (wifi_down_since) {
+        Serial.printf("[wifi] 已恢复，断网 %lus\n", (millis() - wifi_down_since) / 1000);
+        wifi_down_since = 0;
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // 恢复后重新校时（签名用 ts）
     }
 
     // 定期续期已移除（见 request 层自动续期）：浅睡时主循环冻结不会跑这里，无唤醒耗电问题
