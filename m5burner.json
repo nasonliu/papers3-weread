@@ -15,6 +15,6 @@
             }
         }
     ],
-    "version": "0.2.5",
+    "version": "0.2.6",
     "framework": "Arduino/ESP-IDF"
 }

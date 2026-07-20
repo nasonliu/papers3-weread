@@ -155,12 +155,22 @@ bool getBookInfo(const String& bookId, BookEntry& out, String& err) {
 bool getChapterInfos(const String& bookId, std::vector<ChapterEntry>& out, String& format_out, String& err) {
     out.clear();
     String body = "{\"bookIds\":[\"" + bookId + "\"]}";
-    HttpResponse r = WR.postJson(String(WEREAD_HOST_WEB) + "/web/book/chapterInfos", body);
-    if (!r.ok()) { err = "chapterInfos HTTP " + String(r.status); return false; }
+    // 大书 chapterInfos 可达数百 KB，弱网下载慢且容易在尾部断流：
+    // 与书架同规——响应不以 } 收尾就是截断，重试一次（TCP 有序，尾巴在=数据全）
+    HttpResponse r;
+    int attempt = 0;
+    for (; attempt < 2; attempt++) {
+        r = WR.postJson(String(WEREAD_HOST_WEB) + "/web/book/chapterInfos", body);
+        if (!r.ok()) { err = "chapterInfos HTTP " + String(r.status); return false; }
+        if (json_tail_complete(r)) break;
+        Serial.printf("[toc] 响应不完整（第 %d 次）%s\n", attempt + 1, attempt ? "" : "，重试一次");
+    }
+    if (!json_tail_complete(r)) { err = "chapterInfos JSON 解析失败: IncompleteInput"; return false; }
 
     // 大书章节多 JSON 可达数百 KB，放 PSRAM；数据在 r.data()/r.length()（非 r.body）
     PsramJsonDocument doc(64 * 1024);
-    if (deserializeJson(doc, r.data(), r.length())) { err = "chapterInfos JSON 解析失败"; return false; }
+    DeserializationError derr = deserializeJson(doc, r.data(), r.length());
+    if (derr) { err = String("chapterInfos JSON 解析失败: ") + derr.c_str(); return false; }
 
     // 兼容 data[] / 顶层；先识别 -2012（服务器拒会话，报"登录过期"而非"无 data[]"）
     int ec = doc["errcode"] | doc["errCode"] | 0;

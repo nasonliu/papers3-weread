@@ -947,3 +947,5 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 3. **续期失败不分类型**：断网导致的 renewal 失败和 wr_rt 真死同等对待，一律 10 分钟冻结续期 → 用户看到的"一直失败"。现在：传输失败 30s 后可再试；服务器拒绝才置 `rt_dead_`（10 分钟防抖）。**wr_rt 死亡时详情页直接引导扫码登录**（`登录已过期，点按屏幕扫码登录`），登录成功自动重试进详情。
 
 另：getChapterInfos 显式识别 -2012（之前报"无 data[]"误导）；curl 对照法再次证明好用——服务器响应在 Mac 上能复现就先别怀疑设备。
+
+**追加（v0.2.6）**：大书 chapterInfos（数百 KB）在弱网下载尾部断流 → `解析失败`。同书架方案：响应不以 `}` 收尾就重试一次；错误信息带 derr 细节。教训：修一类问题（截断）要全接口排查，别只修被报告的那一个（书架修了 chapterInfos 漏了）。另实测澄清：ArduinoJson 7 的 BasicJsonDocument 池可 realloc 增长，"64KB 容量"只是初始块，之前担心的 NoMemory 不存在。
