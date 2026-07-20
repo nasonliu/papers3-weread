@@ -19,6 +19,7 @@
 #include "weread_crypto.h"  // weread::md5_hex()
 #include "weread_client.h"  // WR.cookieHeader()（需鉴权图源重试用）
 #include <WiFi.h>           // WiFi.status()（网络断开时跳过下载）
+#include <M5Unified.h>      // M5.Display（缩略图生成用小画布）
 #include <SD.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
@@ -30,7 +31,8 @@
 #include <new>              // placement new
 
 // ---- 常量 ----
-#define IMG_CACHE_DIR   "/weread/img"   // 图片缓存目录（/weread 由 storage.h 定义为 SD_WEREAD_DIR）
+#define IMG_CACHE_DIR   "/weread/img"   // 老扁平图片缓存（只读回退 + 懒迁移源）
+#define IMG_CACHE_DIR2  "/weread/img2"  // 新分目录缓存（md5 前两位分片；FAT 大目录 open 要线性扫，分片才快）
 static const size_t   IMG_MAX_BYTES  = 512 * 1024;  // 下载/解码文件上限（超出丢弃）
 static const uint32_t IMG_HTTP_TIMEOUT = 8000;      // ms（缩短单图超时，卡死出口更快）
 // 普通浏览器 UA（CDN 按 UA 防风类比按 cookie 多）
@@ -50,6 +52,21 @@ struct DrawCtx {
 static DrawCtx g_dc;
 static PNG* g_png = nullptr;     // 当前解码中的 PNG 对象（PSRAM）
 static std::set<String> g_fail_set; // 会话级负缓存（本次开机内失败的 URL；重启清空给第二次机会）
+static std::set<String> g_no_cache; // 会话级"无文件"负缓存（cached miss 一次后不再反复扫目录）
+
+// ---- 缩略图（书架等小图场景的提速关键）----
+// 小目标绘制若每次全尺寸解码（600x900 的封面 TJpgDec 全 MCU 走一遍 ~0.7s/张），
+// 书架一页 5 张就是 ~4s，翻页必卡。策略：下载时一次性解码生成 128x192 以内的
+// RGB565 位图落 SD（<缓存路径>.thb），小目标绘制直接块搬（~0.1s）。
+#define THUMB_W 128
+#define THUMB_H 192
+static bool make_thumb(const String& img_path);   // 定义在文件尾部 draw_full 之后
+
+// 绘制互斥：解码回调靠全局上下文 g_dc 传参（模块不可重入），
+// 主任务画封面与后台 netjob 生成缩略图都会用，必须串行
+static SemaphoreHandle_t g_draw_mtx = nullptr;
+#define DRAW_LOCK()   do { if (g_draw_mtx) xSemaphoreTakeRecursive(g_draw_mtx, portMAX_DELAY); } while (0)
+#define DRAW_UNLOCK() do { if (g_draw_mtx) xSemaphoreGiveRecursive(g_draw_mtx); } while (0)
 
 // ==================== 下载 ====================
 
@@ -165,14 +182,21 @@ static size_t https_get(const String& url, uint8_t* buf, size_t cap, bool with_c
 
 // ==================== SD 缓存 ====================
 
-// 缓存命中检查（要求存在且非空）
+// 缓存命中检查（要求存在且非空；直接 open 一次，比 exists+open 少一次目录扫描）
 static bool cache_hit(const String& path) {
-    if (!SD.exists(path.c_str())) return false;
     File f = SD.open(path.c_str(), "r");
     if (!f) return false;
     size_t s = f.size();
     f.close();
     return s > 0;
+}
+
+// 缓存基路径：新布局 /weread/img2/<md5前两位>/<md5>（分片小目录，open 只要几毫秒）。
+// 老布局 /weread/img/<md5>（扁平大目录，open 扫目录 ~200ms）只读回退，懒迁移走。
+static String cache_base(const String& url, bool sharded) {
+    String h = weread::md5_hex(url);
+    if (sharded) return String(IMG_CACHE_DIR2) + "/" + h.substring(0, 2) + "/" + h;
+    return String(IMG_CACHE_DIR) + "/" + h;
 }
 
 // 读整个 SD 文件到 PSRAM（最多 cap 字节）；成功返回缓冲（调用方负责 heap_caps_free），*out_len 为长度，失败 nullptr
@@ -212,28 +236,32 @@ void housekeeping() {
 }
 
 void begin() {
+    if (!g_draw_mtx) g_draw_mtx = xSemaphoreCreateRecursiveMutex();
     if (!storage_sd_ok()) {
         Serial.println("[img] SD 不可用，图片缓存关闭");
         return;
     }
     SD.mkdir(SD_WEREAD_DIR);    // 逐级建目录（已存在时 mkdir 返回失败，忽略）
     SD.mkdir(IMG_CACHE_DIR);
-    Serial.printf("[img] 缓存目录就绪 %s\n", IMG_CACHE_DIR);
+    SD.mkdir(IMG_CACHE_DIR2);
+    Serial.printf("[img] 缓存目录就绪 %s（新布局 %s）\n", IMG_CACHE_DIR, IMG_CACHE_DIR2);
 }
 
 String fetch(const String& url) {
     if (!storage_sd_ok() || url.isEmpty()) return "";
 
-    // 1) 查缓存（jpg/png/gif 三种扩展名都试）
-    String base = String(IMG_CACHE_DIR) + "/" + weread::md5_hex(url);
+    // 1) 查缓存（jpg/png/gif 三种扩展名都试，分目录/扁平两种布局都找）
+    String base = cache_base(url, true);   // 新缓存写分目录
+    String nkey = weread::md5_hex(url);    // 负缓存键（与布局无关）
+    g_no_cache.erase(url);                 // 下载意图明确，忽略"无文件"负缓存（cached 会真实查一遍）
     String hit = cached(url);
     if (hit.length()) return hit;
     // 会话级负缓存：本次开机失败过的不再反复试（重启即清空，给瞬时失败第二次机会）
-    if (g_fail_set.count(base)) return "";
+    if (g_fail_set.count(nkey)) return "";
     // 熔断：连续失败 3 次后 60s 内不再尝试下载（网络挂时防重试风暴卡死主循环）
     if (millis() < g_breaker_until) return "";
     // 网络都没连上就别下了（DNS 必败，省 15 秒/张）
-    if (WiFi.status() != WL_CONNECTED) { g_fail_set.insert(base); return ""; }
+    if (WiFi.status() != WL_CONNECTED) { g_fail_set.insert(nkey); return ""; }
 
     // 2) 下载到 PSRAM（裸取失败用 weread cookie 重试：res.weread.qq.com 插图需鉴权；连接级失败不重试）
     uint8_t* buf = (uint8_t*)heap_caps_malloc(IMG_MAX_BYTES, MALLOC_CAP_SPIRAM);
@@ -243,7 +271,7 @@ String fetch(const String& url) {
     if (n == 0 && kind == 2) n = https_get(url, buf, IMG_MAX_BYTES, true, &kind); // 仅 HTTP 层失败才用 cookie 重试
     if (n < 8) {  // 过短不可能是有效图片（也保证下面读前 4 字节安全）
         heap_caps_free(buf);
-        g_fail_set.insert(base); // 记负缓存（仅本次开机有效）
+        g_fail_set.insert(nkey); // 记负缓存（仅本次开机有效）
         // 熔断计数：连续 3 次失败熔断 60s
         if (++g_consec_fail >= 3) {
             g_consec_fail = 0;
@@ -260,35 +288,68 @@ String fetch(const String& url) {
         Serial.printf("[img] 非 jpeg/png（magic=%02X %02X %02X %02X），丢弃 %s\n",
                       buf[0], buf[1], buf[2], buf[3], url.c_str());
         heap_caps_free(buf);
-        g_fail_set.insert(base);
+        g_fail_set.insert(nkey);
         return "";
     }
     String path = base + (fmt == 1 ? ".jpg" : fmt == 2 ? ".png" : ".gif");
 
-    // 4) 写 SD 缓存
+    // 4) 写 SD 缓存（分目录子目录按需建）
     SD.mkdir(SD_WEREAD_DIR);    // begin() 未跑时兜底
-    SD.mkdir(IMG_CACHE_DIR);
+    SD.mkdir(IMG_CACHE_DIR2);
+    String sub = String(IMG_CACHE_DIR2) + "/" + weread::md5_hex(url).substring(0, 2);
+    SD.mkdir(sub.c_str());
     File f = SD.open(path.c_str(), "w");
     if (!f) { heap_caps_free(buf); Serial.println("[img] 缓存写打开失败"); return ""; }
     size_t wn = f.write(buf, n);
     f.close();
     heap_caps_free(buf);
     if (wn != n) { SD.remove(path.c_str()); Serial.println("[img] 缓存写不完整，已删除"); return ""; }
-    g_fail_set.erase(base); // 成功则清除负缓存记录
+    g_fail_set.erase(nkey); // 成功则清除负缓存记录
     Serial.printf("[img] 已缓存 %s（%u B）\n", path.c_str(), (unsigned)n);
+    make_thumb(path); // 顺手生成缩略图（一次性全解码；书架等小图绘制之后走快路径）
     return path;
 }
 
-// 只查缓存不下载（分页估算用）
+// 老缓存（扁平路径）懒迁移到分目录：rename 是元数据操作，首次访问花一次目录扫描，
+// 之后永久走小目录（否则老用户的几百个扁平缓存文件永远享受不到提速）
+static std::set<String> g_shard_dirs; // 本机已建过的分目录（防每次 mkdir 重复扫目录）
+static String migrate_if_legacy(const String& legacy_path) {
+    int sl = legacy_path.lastIndexOf('/');
+    if (sl < 0) return legacy_path;
+    String dir = legacy_path.substring(0, sl);
+    if (dir != IMG_CACHE_DIR) return legacy_path;   // 已在新布局
+    String name = legacy_path.substring(sl + 1);    // <md5>.<ext>
+    String sub = String(IMG_CACHE_DIR2) + "/" + name.substring(0, 2);
+    if (!g_shard_dirs.count(sub)) {
+        SD.mkdir(IMG_CACHE_DIR2);
+        SD.mkdir(sub.c_str());
+        g_shard_dirs.insert(sub);
+    }
+    String target = sub + "/" + name;
+    if (SD.rename(legacy_path.c_str(), target.c_str())) {
+        String thb = legacy_path + ".thb";
+        if (SD.exists(thb.c_str())) SD.rename(thb.c_str(), (target + ".thb").c_str());
+        return target;
+    }
+    return legacy_path;
+}
+
+// 只查缓存不下载（分页估算用）；先找分目录（新布局），再回退扁平（老缓存，顺手迁移）
 String cached(const String& url) {
     if (!storage_sd_ok() || url.isEmpty()) return "";
-    String base = String(IMG_CACHE_DIR) + "/" + weread::md5_hex(url);
-    String pj = base + ".jpg";
-    String pp = base + ".png";
-    String pg = base + ".gif";
-    if (cache_hit(pj)) return pj;
-    if (cache_hit(pp)) return pp;
-    if (cache_hit(pg)) return pg;
+    if (g_no_cache.count(url)) return "";
+    String found;
+    for (int s = 1; s >= 0; s--) {
+        String base = cache_base(url, s == 1);
+        String pj = base + ".jpg";
+        String pp = base + ".png";
+        String pg = base + ".gif";
+        if (cache_hit(pj)) { found = pj; break; }
+        if (cache_hit(pp)) { found = pp; break; }
+        if (cache_hit(pg)) { found = pg; break; }
+    }
+    if (found.length()) return migrate_if_legacy(found);
+    g_no_cache.insert(url);
     return "";
 }
 
@@ -588,10 +649,8 @@ static int draw_gif(M5Canvas* cv, uint8_t* buf, size_t n, int x, int y, int max_
     return g_dc.th;
 }
 
-namespace img_render {
-
-int draw(M5Canvas* cv, const String& path, int x, int y, int max_w, int max_h) {
-    if (!cv || max_w <= 0 || max_h <= 0) return 0;
+// ---- 全尺寸解码绘制（原 draw 本体）----
+static int draw_full(M5Canvas* cv, const String& path, int x, int y, int max_w, int max_h) {
     size_t n = 0;
     uint8_t* buf = read_sd_psram(path, IMG_MAX_BYTES, &n);
     if (!buf) { Serial.printf("[img] 读文件失败 %s\n", path.c_str()); return 0; }
@@ -603,6 +662,96 @@ int draw(M5Canvas* cv, const String& path, int x, int y, int max_w, int max_h) {
     else Serial.printf("[img] 未知图片格式 %s\n", path.c_str());
     heap_caps_free(buf);
     return rc;
+}
+
+// ---- 缩略图 ----
+static String thumb_path(const String& img_path) { return img_path + ".thb"; }
+
+// 生成缩略图：全尺寸解码一次到小画布，RGB565 位图落 SD（4 字节 w/h 头 + w*h*2 字节）
+static bool make_thumb(const String& img_path) {
+    if (!storage_sd_ok()) return false;
+    int w0 = 0, h0 = 0;
+    if (!img_render::size(img_path, w0, h0)) { Serial.println("[thb] size 解析失败"); return false; }
+    int tw, th;
+    fit_box(w0, h0, THUMB_W, THUMB_H, tw, th);
+    if (tw < 8 || th < 8) { Serial.println("[thb] 图太小"); return false; }
+    M5Canvas c(&M5.Display);
+    c.setColorDepth(16);
+    if (!c.createSprite(tw, th)) { Serial.println("[thb] createSprite 失败"); return false; }
+    c.fillSprite(TFT_WHITE);
+    int drawn = draw_full(&c, img_path, 0, 0, tw, th); // 直接走全尺寸版，不走缩略图（防递归）
+    if (drawn <= 0) { c.deleteSprite(); Serial.println("[thb] 全尺寸解码失败"); return false; }
+    File f = SD.open(thumb_path(img_path).c_str(), "w");
+    if (!f) { c.deleteSprite(); Serial.println("[thb] 写打开失败"); return false; }
+    uint8_t hdr[4] = { (uint8_t)(tw & 0xFF), (uint8_t)(tw >> 8), (uint8_t)(th & 0xFF), (uint8_t)(th >> 8) };
+    f.write(hdr, 4);
+    size_t want = (size_t)tw * th * 2;
+    size_t wn = f.write((const uint8_t*)c.getBuffer(), want);
+    f.close();
+    c.deleteSprite();
+    if (wn != want) { SD.remove(thumb_path(img_path).c_str()); Serial.println("[thb] 写不完整"); return false; }
+    return true;
+}
+
+// 缩略图直绘：位图读进 PSRAM 后原位下采样、单次 pushImage 块搬
+static int draw_thumb(M5Canvas* cv, const String& img_path, int x, int y, int max_w, int max_h) {
+    String tp = thumb_path(img_path);
+    if (!SD.exists(tp.c_str())) return 0; // 先查存在，避免 SD.open 失败刷屏
+    File f = SD.open(tp.c_str(), "r");
+    if (!f) return 0;
+    uint8_t hdr[4];
+    if (f.read(hdr, 4) != 4) { f.close(); return 0; }
+    int tw = hdr[0] | (hdr[1] << 8), th = hdr[2] | (hdr[3] << 8);
+    if (tw <= 0 || th <= 0 || tw > THUMB_W || th > THUMB_H) { f.close(); return 0; }
+    size_t want = (size_t)tw * th * 2;
+    uint16_t* buf = (uint16_t*)heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
+    if (!buf) { f.close(); return 0; }
+    size_t got = f.read((uint8_t*)buf, want);
+    f.close();
+    if (got != want) { heap_caps_free(buf); return 0; }
+    int dw, dh;
+    fit_box(tw, th, max_w, max_h, dw, dh); // 缩略图已按比例，通常 1:1 或略缩
+    int ox = x + (max_w - dw) / 2, oy = y + (max_h - dh) / 2;
+    if (dw != tw || dh != th) {
+        // 原位下采样（读指针始终领先写指针，安全覆盖），避免逐行 pushImage 的调用开销
+        for (int yy = 0; yy < dh; yy++) {
+            const uint16_t* src = buf + (int)((int32_t)yy * th / dh) * tw;
+            uint16_t* dst = buf + yy * dw;
+            for (int xx = 0; xx < dw; xx++) dst[xx] = src[(int)((int32_t)xx * tw / dw)];
+        }
+    }
+    cv->pushImage(ox, oy, dw, dh, buf); // 单次整块搬（memcpy 级）
+    heap_caps_free(buf);
+    return dh;
+}
+
+namespace img_render {
+
+int draw(M5Canvas* cv, const String& path, int x, int y, int max_w, int max_h) {
+    if (!cv || max_w <= 0 || max_h <= 0) return 0;
+    DRAW_LOCK();
+    int rc;
+    // 小目标优先缩略图快路径（书架一页 5 张，全尺寸解码 ~0.7s/张扛不住）；
+    // 无缩略图（老缓存/下载时生成失败）现场补生成一次，之后都走快路径
+    if (max_w <= THUMB_W && max_h <= THUMB_H) {
+        rc = draw_thumb(cv, path, x, y, max_w, max_h);
+        if (rc > 0) { DRAW_UNLOCK(); return rc; }
+        if (make_thumb(path)) {
+            rc = draw_thumb(cv, path, x, y, max_w, max_h);
+            if (rc > 0) { DRAW_UNLOCK(); return rc; }
+        }
+    }
+    rc = draw_full(cv, path, x, y, max_w, max_h);
+    DRAW_UNLOCK();
+    return rc;
+}
+
+void ensure_thumb(const String& path) {
+    if (!storage_sd_ok() || path.isEmpty()) return;
+    if (SD.exists(thumb_path(path).c_str())) return;
+    DRAW_LOCK();
+    make_thumb(path);
+    DRAW_UNLOCK();
 }
 
 } // namespace img_render

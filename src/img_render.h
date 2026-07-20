@@ -17,6 +17,8 @@ String cached(const String& url);
 String fetch_raw(const String& url, const String& out_path);
 // 读图片宽高（只解析文件头，不全解码）；失败返回 false
 bool size(const String& path, int& w, int& h);
+// 确保缩略图存在：没有就在后台生成（书架预取调用，老缓存自愈）
+void ensure_thumb(const String& path);
 // 把图片等比缩放画到 canvas 的 (x, y, max_w, max_h) 区域内（居中、保宽高比、转灰度 color565(v,v,v)），返回实际绘制高度，失败 0
 int draw(M5Canvas* cv, const String& path, int x, int y, int max_w, int max_h);
 }
