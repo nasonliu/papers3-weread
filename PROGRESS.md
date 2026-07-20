@@ -1,6 +1,6 @@
 # PaperS3 微信读书阅读器 — 项目进度 / 交接文档
 
-> 最后更新：2026-07-20（书架性能大修 + 唤醒 WiFi 修复，v0.2.5）
+> 最后更新：2026-07-20（页间断行根因修复 + 长书 reader 截断修复，v0.2.7）
 > 状态：**功能全链路可用并已发布 v0.1.0**（GitHub: nasonliu/papers3-weread）。**ESP32 访问 weread 接口间歇性 TCP 连接失败的底层根因仍未闭环；已另外确认同步网络重试会把偶发失败放大成数分钟的界面“卡住”**（见第〇节）。
 
 ---
@@ -949,3 +949,26 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 另：getChapterInfos 显式识别 -2012（之前报"无 data[]"误导）；curl 对照法再次证明好用——服务器响应在 Mac 上能复现就先别怀疑设备。
 
 **追加（v0.2.6）**：大书 chapterInfos（数百 KB）在弱网下载尾部断流 → `解析失败`。同书架方案：响应不以 `}` 收尾就重试一次；错误信息带 derr 细节。教训：修一类问题（截断）要全接口排查，别只修被报告的那一个（书架修了 chapterInfos 漏了）。另实测澄清：ArduinoJson 7 的 BasicJsonDocument 池可 realloc 增长，"64KB 容量"只是初始块，之前担心的 NoMemory 不存在。
+
+---
+
+## 十八、页间断行根因 + 长书 reader 截断 + 一批边角修复（2026-07-20，v0.2.7）
+
+### 页脚吞行/第二页接不上（用户报"严重 bug"）
+
+**根因**：`paginate_current` 对空行（trim 后为空的行）完全跳过不占高度，而 `render_page` 对空行也加段距（`if (para && y > 80) y += pg_gap` 无条件执行）——每条空段首行让渲染多积 11px，每页因此比分页器早 ~1 行满，分页器算进本页的最后 1 行渲染没画，而下页游标又从那行之后开始 → **整行凭空消失**（每页末一行）。复现工具：`dbgpages`（渲染走行 vs 分页游标对比，直接打印被跳过的文本）、`dbgtrace`（双走行逐行对拍，定位到首个空行分歧点）。修法：render_page 文本分支改为与分页器同序（先算行、trim、非空才计高加段距）。**教训：两套"同款"走行逻辑必须逐行对拍验证，不能靠目测"看起来一样"。**
+
+### 长书打不开（"未提取到 psvts"）
+
+**根因**：长书的 reader HTML 巨大（1281 章实测 981KB，psvts 在 863KB 处），ShardRespBuf 固定 768KB 静默截断 → 页尾 psvts 被切。修法：ShardRespBuf 改动态扩容（256KB→2MB，同 WereadClient 策略），超上限置 overflow 报错不静默。**教训加深：全项目搜"容量上限+静默丢弃"，一处都不能留（WereadClient / ShardSession / 各处 buffer 已齐）。另注意 `is_txt = ... || n0 == 0`：e_0 传输失败会误判成 TXT 书走 t 分片——本次没改，留意。**
+
+### 其他修复
+
+- **chapterInfos NoMemory**：ArduinoJson 池初始 64KB 靠 realloc 扩，PSRAM 碎片下扩失败 → NoMemory。改初始池按响应长一半给（64KB~1MB），避免中途扩。
+- **封面章零块**：`<h1><img/></h1>` 结构里图片被标题分支当文本吞 → 整章 0 块报"无内容块"。切块器先出标题内图块。
+- **整本已下载**：下载完成写 `done.flag`，详情页按钮显示"已下载"且防重复下载；目录变多自动失效。
+- **skey 短命**：wr_skey Max-Age 只有 5400s（90 分钟），靠续期链路兜底，不能假设它长寿。
+
+### 排障工具沉淀
+
+`dbgch <bookId> <chapterUid>`（章节解码打印）、`dbgpages`（页边界断行检查）、`time`（时钟/签名）、`netdiag/netapi`（网络分层）、`[reader]/[txt]/[shelf]` 失败现场打印（hlen/head/MD5）。**方法论：服务端响应先用 curl/Python 参考实现拿"标准答案"，再决定怀疑设备哪一层。**

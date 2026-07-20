@@ -507,6 +507,22 @@ static bool blocks_cache_exists(const String& bookId, const String& chapterUid) 
     return storage_sd_ok() && SD.exists(blocks_cache_path(bookId, chapterUid));
 }
 
+// 整本下载完成标记：<bookId>/done.flag 存章节总数；与当前目录数一致才算"已下载"
+// （目录变多（出新章）则失效，按钮恢复可点，可补下载新章）
+static bool book_download_done(const String& bookId, int total) {
+    if (!storage_sd_ok() || total <= 0) return false;
+    File f = SD.open(book_cache_dir(bookId) + "/done.flag", "r");
+    if (!f) return false;
+    int n = f.readStringUntil('\n').toInt();
+    f.close();
+    return n == total;
+}
+static void book_download_done_mark(const String& bookId, int total) {
+    if (!storage_sd_ok()) return;
+    File f = SD.open(book_cache_dir(bookId) + "/done.flag", "w");
+    if (f) { f.println(total); f.close(); }
+}
+
 static void blocks_cache_save(const String& bookId, const String& chapterUid, const std::vector<ContentBlock>& blocks) {
     if (!storage_sd_ok() || blocks.empty()) return;
     SD.mkdir(SD_WEREAD_DIR);
@@ -830,11 +846,14 @@ static void render_book_detail() {
         }
     }
 
-    // 底部按钮：[继续阅读] [下载整本]；下方小开关：[插图:开/关]（图多的书关掉后不下载不渲染）
+    // 底部按钮：[继续阅读] [下载整本/已下载]；下方小开关：[插图:开/关]（图多的书关掉后不下载不渲染）
+    bool dl_done = book_download_done(b.bookId, g_chapters.size());
     canvas.drawRect(30, SCREEN_H - 130, 220, 66, TFT_BLACK);
     canvas.drawRect(290, SCREEN_H - 130, 220, 66, TFT_BLACK);
     drawUI("继续阅读", 30 + (220 - textWidthUI("继续阅读")) / 2, SCREEN_H - 116);
-    drawUI("下载整本", 290 + (220 - textWidthUI("下载整本")) / 2, SCREEN_H - 116);
+    const char* dl_label = dl_done ? "已下载" : "下载整本";
+    drawUI(dl_label, 290 + (220 - textWidthUI(dl_label)) / 2, SCREEN_H - 116);
+    Serial.printf("[详情] 整本下载状态: %s\n", dl_label);
     bool imgoff = book_img_off(b.bookId);
     canvas.drawRect(30, SCREEN_H - 56, 220, 44, TFT_BLACK);
     String imgt = imgoff ? "插图：关" : "插图：开";
@@ -987,6 +1006,10 @@ static void download_all() {
         draw_download_progress(b.title, done, total, fetched); // 每章更新（异步推送）
     }
     Serial.printf("[下载] 完成 %d/%d 新拉 %d 耗时 %lus\n", done, total, fetched, (millis() - t0) / 1000);
+    if (done == total && total > 0) { // 全量完成才打标：部分完成不标（补漏时按钮还可用）
+        book_download_done_mark(b.bookId, total);
+        Serial.println("[下载] 已标记 done.flag");
+    }
     screen_msg("下载完成", b.title, String(done) + "/" + String(total) + " 章");
     render_book_detail();
 }
@@ -1277,13 +1300,15 @@ static void render_page(epd_mode_t mode, bool wait) {
             float wsc = (st == 1) ? 2.0f : 1.0f;
             bool para = (st == 0) && is_para_start(b.text, cur.off); // 标题不做首行缩进
             int indent = para ? para_indent_w() : 0;
-            int need = blh + ((para && y > 80) ? pg_gap : 0); // 段首行加段间距（页首不加）
-            if (y + need > H && y > 80) break;                // 与分页同款判定
-            if (para && y > 80) y += pg_gap;
+            // 与分页器同序：先算行再判定。空行（trim 后为空）必须与分页器一样完全跳过——
+            // 否则渲染对空行也加段距，每页多挤出约一行，页间整行丢失（页脚吞行/断行根因）
             int end = next_line_end(g_read_font, b.text, cur.off, max_w - indent, wsc);
             String line = b.text.substring(cur.off, end);
             line.trim();
             if (line.length()) {
+                int need = blh + ((para && y > 80) ? pg_gap : 0); // 段首行加段间距（页首不加）
+                if (y + need > H && y > 80) break;                // 与分页同款判定
+                if (para && y > 80) y += pg_gap;
                 drawReadStyle(line, BODY_MARGIN + indent, y, st); // 按原书样式（h1 放大/h2..h4 仿粗）
                 y += blh;
             }
@@ -1558,7 +1583,13 @@ static void handle_book_touch(int x, int y) {
     }
     if (y >= SCREEN_H - 130 && y <= SCREEN_H - 64) { // 底部按钮
         if (x >= 30 && x <= 250)  { Serial.println("[触摸] 继续阅读"); continue_reading(); return; }
-        if (x >= 290 && x <= 510) { Serial.println("[触摸] 下载整本"); download_all(); return; }
+        if (x >= 290 && x <= 510) {
+            if (book_download_done(g_cur_book.bookId, g_chapters.size())) {
+                Serial.println("[触摸] 已下载，忽略重复下载");
+                return;
+            }
+            Serial.println("[触摸] 下载整本"); download_all(); return;
+        }
     }
     if (y > SCREEN_H - 64 && y <= SCREEN_H - 6 && x >= 30 && x <= 250) { // 插图开关
         bool now = !book_img_off(g_cur_book.bookId);
@@ -1899,6 +1930,10 @@ void loop() {
                           gpio_get_level(GPIO_NUM_5), (int)M5.Power.isCharging());
             return;
         }
+        if (line == "time") { // 诊断：当前时钟（签名请求 ct 依赖正确校时）
+            Serial.printf("[time] unix=%lu millis=%lu\n", (unsigned long)time(nullptr), (unsigned long)(millis() / 1000));
+            return;
+        }
         if (line == "books") { // 打印当前书架（测试用）
             for (size_t i = 0; i < g_shelf.size(); i++)
                 Serial.printf("  %d. %s [%s]\n", i + 1, g_shelf[i].title.c_str(), g_shelf[i].bookId.c_str());
@@ -1909,6 +1944,59 @@ void loop() {
             book_img_off_set(g_cur_book.bookId, now);
             Serial.printf("[img] 插图开关 → %s\n", now ? "关" : "开");
             if (g_screen == SCR_READING && !g_pages.empty()) render_page(epd_mode_t::epd_quality, true);
+            return;
+        }
+        if (line == "dbgpages") { // 调试：按渲染走行打印每页首/末行，查页间断行
+            int lh = read_line_h(), pg_gap = para_gap(), max_w = page_max_w(), H = 80 + page_area_h();
+            for (int pg = 0; pg < (int)g_pages.size(); pg++) {
+                Cursor cur = g_pages[pg];
+                int y = 80;
+                String firstLine, lastLine;
+                bool overflow = false;
+                while (cur.blk < (int)g_blocks.size()) {
+                    ContentBlock& b = g_blocks[cur.blk];
+                    if (b.is_image) {
+                        if (book_img_off(g_cur_book.bookId)) { cur.blk++; cur.off = 0; continue; }
+                        int h = img_block_h(b.text);
+                        y += h + lh / 2;
+                        cur.blk++; cur.off = 0;
+                        if (y > SCREEN_H - 60) { overflow = true; break; }
+                        continue;
+                    }
+                    if (cur.off >= (int)b.text.length()) { cur.blk++; cur.off = 0; continue; }
+                    uint8_t st = b.style;
+                    int blh = (st == 1) ? lh * 2 : lh;
+                    float wsc = (st == 1) ? 2.0f : 1.0f;
+                    bool para = (st == 0) && is_para_start(b.text, cur.off);
+                    int indent = para ? para_indent_w() : 0;
+                    int end = next_line_end(g_read_font, b.text, cur.off, max_w - indent, wsc);
+                    String l = b.text.substring(cur.off, end); l.trim();
+                    if (l.length()) {
+                        int need = blh + ((para && y > 80) ? pg_gap : 0);
+                        if (y + need > H && y > 80) { overflow = true; break; }
+                        if (para && y > 80) y += pg_gap;
+                        if (!firstLine.length()) firstLine = l;
+                        lastLine = l;
+                        y += blh;
+                    }
+                    cur.off = end;
+                }
+                // 渲染停止点 vs 分页器给的下页起点：不一致就是有文本被跳过（断行实锤）
+                String gap;
+                if (pg + 1 < (int)g_pages.size()) {
+                    Cursor nx = g_pages[pg + 1];
+                    if (cur.blk == nx.blk && cur.off < nx.off) {
+                        gap = g_blocks[cur.blk].text.substring(cur.off, nx.off);
+                        gap.trim();
+                    }
+                }
+                Serial.printf("页%d(%d:%d) y=%d 首[%s] 尾[%s]%s%s\n", pg + 1, g_pages[pg].blk, g_pages[pg].off, y,
+                              firstLine.substring(0, 30).c_str(),
+                              lastLine.substring(0, 30).c_str(),
+                              overflow ? "" : "（未满）",
+                              gap.length() ? (" 跳过[" + gap + "]").c_str() : "");
+            }
+            Serial.println("[dbgpages] end");
             return;
         }
         if (line == "wipe") { // 清掉登录态与阅读状态（还原干净机器，测首次开机用）

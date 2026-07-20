@@ -167,8 +167,13 @@ bool getChapterInfos(const String& bookId, std::vector<ChapterEntry>& out, Strin
     }
     if (!json_tail_complete(r)) { err = "chapterInfos JSON 解析失败: IncompleteInput"; return false; }
 
-    // 大书章节多 JSON 可达数百 KB，放 PSRAM；数据在 r.data()/r.length()（非 r.body）
-    PsramJsonDocument doc(64 * 1024);
+    // 大书章节多 JSON 可达数百 KB。初始池按输入长度给：
+    // 池中不够时会 realloc 扩（旧+新块瞬时并存，PSRAM 碎片下会失败 → NoMemory），
+    // 一次性给足避免中途扩。数据在 r.data()/r.length()（非 r.body）
+    size_t cap = r.length() / 2;
+    if (cap < 64 * 1024) cap = 64 * 1024;
+    if (cap > 1024 * 1024) cap = 1024 * 1024;
+    PsramJsonDocument doc(cap);
     DeserializationError derr = deserializeJson(doc, r.data(), r.length());
     if (derr) { err = String("chapterInfos JSON 解析失败: ") + derr.c_str(); return false; }
 
@@ -430,20 +435,39 @@ static uint8_t* download_epub_post(const String& url, const String& body, const 
 // 与 WereadClient 的普通请求路径完全隔离（书架/详情等仍走 WR，不受影响）。
 // 会话跨章静态保留（整书下载全程复用）；perform 失败即丢弃重建重试一次，仍失败则报错（不卡死）。
 
-// 会话响应缓冲（PSRAM；分片单片实测 ~116KB，768KB 留足余量）
+// 会话响应缓冲（PSRAM）：初始 256KB 按需翻倍，上限 2MB。
+// 分片单片实测 ~116KB；长书 reader HTML 可达 ~1MB（1281 章实测 981KB）。
+// 旧版固定 768KB 静默截断（页尾 psvts 被切掉，长书永远打不开）；
+// 固定 2MB 则 PSRAM 碎片下分配直接失败（"连接失败"假象）——故改按需增长。
 struct ShardRespBuf {
     char* psbuf = nullptr;
     size_t pslen = 0;
-    static const size_t CAP = 768 * 1024;
+    size_t pscap = 0;
+    bool overflow = false;   // 增长到顶仍放不下：当失败处理，绝不静默截断
+    static const size_t INIT = 256 * 1024;
+    static const size_t CAP  = 2 * 1024 * 1024;
 };
 
-// esp_http_client 事件回调：响应体累积到 PSRAM 缓冲（超上限丢弃，语义同 WereadClient）
+// esp_http_client 事件回调：响应体累积到 PSRAM 缓冲，不够翻倍扩（同 WereadClient 策略）
 static esp_err_t shard_http_event(esp_http_client_event_t* evt) {
     ShardRespBuf* sr = (ShardRespBuf*)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && sr->psbuf && evt->data_len > 0) {
-        if (sr->pslen + (size_t)evt->data_len <= ShardRespBuf::CAP) {
+    if (evt->event_id == HTTP_EVENT_ON_DATA && sr && evt->data_len > 0) {
+        size_t need = sr->pslen + evt->data_len;
+        if (need > sr->pscap) {
+            size_t newcap = sr->pscap ? sr->pscap : ShardRespBuf::INIT;
+            while (newcap < need && newcap < ShardRespBuf::CAP) newcap *= 2;
+            if (newcap > ShardRespBuf::CAP) newcap = ShardRespBuf::CAP;
+            if (newcap >= need) {
+                char* nb = (char*)heap_caps_realloc(sr->psbuf, newcap, MALLOC_CAP_SPIRAM);
+                if (nb) { sr->psbuf = nb; sr->pscap = newcap; }
+                else Serial.printf("[shard] PSRAM 扩到 %u KB 失败\n", (unsigned)(newcap / 1024));
+            }
+        }
+        if (sr->pslen + evt->data_len <= sr->pscap) {
             memcpy(sr->psbuf + sr->pslen, evt->data, evt->data_len);
             sr->pslen += evt->data_len;
+        } else {
+            sr->overflow = true;
         }
     }
     return ESP_OK;
@@ -478,7 +502,7 @@ struct ShardSession {
         cfg.event_handler = shard_http_event;
         cfg.user_data = &rb;
         client = esp_http_client_init(&cfg);
-        if (!client && rb.psbuf) { heap_caps_free(rb.psbuf); rb.psbuf = nullptr; }
+        if (!client && rb.psbuf) { heap_caps_free(rb.psbuf); rb.psbuf = nullptr; rb.pscap = 0; }
         return client != nullptr;
     }
 
@@ -499,10 +523,12 @@ struct ShardSession {
         pace(); // 节流：请求间隔 ≥400ms（防风控）
         if (!open()) return nullptr;
         if (!rb.psbuf) {
-            rb.psbuf = (char*)heap_caps_malloc(ShardRespBuf::CAP, MALLOC_CAP_SPIRAM);
-            if (!rb.psbuf) return nullptr;
+            rb.psbuf = (char*)heap_caps_malloc(ShardRespBuf::INIT, MALLOC_CAP_SPIRAM);
+            if (!rb.psbuf) { Serial.println("[shard] PSRAM 分配失败"); return nullptr; }
+            rb.pscap = ShardRespBuf::INIT;
         }
         rb.pslen = 0;
+        rb.overflow = false;
         esp_http_client_set_url(client, path.c_str());
         esp_http_client_set_method(client, post ? HTTP_METHOD_POST : HTTP_METHOD_GET);
         // headers 每次请求重设（Referer 每章不同；cookie 可能被 renewal 轮换）
@@ -519,14 +545,24 @@ struct ShardSession {
             esp_http_client_set_post_field(client, nullptr, 0); // 清掉上次 POST body
         }
         esp_err_t e = esp_http_client_perform(client);
-        if (e != ESP_OK) return nullptr; // status 保持 -1：连接级失败
+        if (e != ESP_OK) {
+            Serial.printf("[shard] perform 失败 err=%s path=%s\n", esp_err_to_name(e), path.c_str());
+            return nullptr; // status 保持 -1：连接级失败
+        }
         status = esp_http_client_get_status_code(client);
         last_use = millis();
+        if (rb.overflow) { // 超 2MB 上限被截断：残页不能用（psvts 在页尾），当失败上报
+            Serial.printf("[shard] 响应超 %u KB 上限被截断 %s\n",
+                          (unsigned)(ShardRespBuf::CAP / 1024), path.c_str());
+            rb.overflow = false;
+            return nullptr;
+        }
         // 转移数据所有权（缓冲已补 \0 便于字符串扫描）
         char* out = rb.psbuf;
-        rb.psbuf = nullptr;
+        size_t cap = rb.pscap;
+        rb.psbuf = nullptr; rb.pscap = 0;
         out_len = rb.pslen;
-        if (out_len < ShardRespBuf::CAP) out[out_len] = 0;
+        if (out_len < cap) out[out_len] = 0;
         return out;
     }
 
@@ -585,8 +621,19 @@ static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, Chap
         if (!html) { err = "reader 请求失败"; return false; }
         if (status < 200 || status >= 300) { heap_caps_free(html); err = "reader HTTP " + String(status); return false; }
         psvts = extractPsvts(html, hlen);
+        if (!psvts.length()) {
+            // 打印现场：长度+开头+关键标记+实际请求路径，区分截断/结构变化/路径错
+            Serial.printf("[reader] psvts 提取失败 hlen=%u INITIAL=%s psvts裸=%s path=%s head=%.100s\n",
+                          (unsigned)hlen,
+                          (hlen && strstr(html, "__INITIAL_STATE__")) ? "有" : "无",
+                          (hlen && strstr(html, "psvts")) ? "有" : "无",
+                          rpath.c_str(),
+                          hlen ? html : "(空)");
+            heap_caps_free(html);
+            err = "未提取到 psvts";
+            return false;
+        }
         heap_caps_free(html);
-        if (!psvts.length()) { err = "未提取到 psvts"; return false; }
         g_psvts_book = bookId;
         g_psvts = psvts;
     }
@@ -679,6 +726,15 @@ static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, Chap
             return false;
         }
         raw.data = weread::decode_content_shards_psram(t0, tn0, t1, tn1, nullptr, 0, &raw.len);
+        if (!raw.data) { // 调试：定位 TXT 解码失败（分片长度+开头+MD5 校验）
+            Serial.printf("[txt] 解码失败 tn0=%u tn1=%u t0头=%.40s\n",
+                          (unsigned)tn0, (unsigned)tn1, (t0 && tn0) ? t0 : "(空)");
+            if (t0 && tn0 > 32) {
+                String md5calc = weread::md5_hex((const uint8_t*)t0 + 32, tn0 - 32);
+                md5calc.toUpperCase();
+                Serial.printf("[txt] t0 前缀MD5=%.32s 实算=%.32s\n", t0, md5calc.c_str());
+            }
+        }
         if (t0) heap_caps_free(t0);
         if (t1) heap_caps_free(t1);
         if (!raw.data) { err = "TXT 解码失败"; return false; }
@@ -1198,6 +1254,14 @@ static void xhtml_to_blocks(const char* raw, size_t rawlen, const String& epub_d
             char close[5] = {'<', '/', 'h', (char)('0' + lvl), '>'};
             int ce = find_sub(raw, rawlen, gt + 1, close, 5);
             if (ce < 0) { pos = gt + 1; continue; } // 无闭合按普通文本继续扫
+            // 标题内若含 <img>（如封面页 <h1><img/></h1>）：先出图块，别让标题分支把图吞了
+            // （否则图片被当标题文本去标签后变空，整章零块→"章节无内容块"）
+            int h_im = find_sub(raw, rawlen, gt + 1, "<img", 4);
+            if (h_im >= 0 && h_im < ce) {
+                push_text(raw + gt + 1, (size_t)h_im - (gt + 1), lvl); // 图前标题文字照常
+                pos = h_im; // 交回主循环按图片处理，标题剩余部分下一轮再扫
+                continue;
+            }
             push_text(raw + gt + 1, (size_t)ce - (gt + 1), lvl);
             pos = ce + 5;
         }
