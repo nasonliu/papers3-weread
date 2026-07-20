@@ -1,6 +1,6 @@
 # PaperS3 微信读书阅读器 — 项目进度 / 交接文档
 
-> 最后更新：2026-07-18（网络对照与长书实机实验补充版）
+> 最后更新：2026-07-20（大书架截断修复 + 失败现场 SD 落盘，v0.2.3）
 > 状态：**功能全链路可用并已发布 v0.1.0**（GitHub: nasonliu/papers3-weread）。**ESP32 访问 weread 接口间歇性 TCP 连接失败的底层根因仍未闭环；已另外确认同步网络重试会把偶发失败放大成数分钟的界面“卡住”**（见第〇节）。
 
 ---
@@ -855,3 +855,35 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 **当前有效登录态**：2026-07-17 设备端扫码登录成功，cookie 存 SD `/weread/config.json`（约 30 天有效）
 
 **已解决的坑**：① 字体黑白反转 ② 书架接口域名（i.weread vs weread.qq.com/web）③ 响应体在 PSRAM 不在 `r.body` ④ AP DHCP 自分配 169.254 ⑤ -2012 字段名 errcode/errCode + filter 过滤。详见第四、五、十三节。
+
+---
+
+## 十五、大书架截断修复 + 失败现场 SD 落盘（2026-07-20，v0.2.3）
+
+用户反馈两类问题：① 配网后"拿不到 uid"（实为 `getLoginUid` 第一步就失败，二维码尚未生成，不是登录态问题）② 扫码后 `shelf JSON 解析失败: IncompleteInput`（书架响应被截断；其中一位用户 500+ 本书）。
+
+**根因与修复**：
+1. **512KB 接收缓冲静默截断**（`weread_client.cpp`）：书架 JSON 超 512KB 后字节被静默丢弃 → 解析必报 IncompleteInput。改为按需翻倍扩容（512KB→4MB 封顶）；到顶仍放不下置 overflow → 当传输失败报 `response too large`，绝不把半个 JSON 交给解析。注意扩容后回调可能搬移缓冲，接管所有权必须用 `rb.psbuf`（不是分配时的旧指针）。
+2. **书架 JSON 文档固定 64KB**（`weread_api.cpp`）：115 本够用，500 本必 NoMemory。改为按响应长度一半给容量（64KB~1MB，实测过滤后约为输入一半：157KB→64KB）。
+3. **截断自动重试**：`json_tail_complete()` 检查响应以 `}` 收尾（TCP 有序，尾巴在 = 一字节没丢），不完整重试一次。
+4. **登录报错区分**（`weread_login.cpp`）：传输失败（"网络不通"）/ 服务器拒绝（带 HTTP 状态码）/ 返回异常 分开显示；"无 uid" 分支补上串口日志（旧版该分支无日志，三种失败共用一句"拿不到 uid"）。
+5. **SD 诊断日志**：`storage_debug_log()`（`storage.cpp`）把失败现场追加到 SD `/weread/debug.log`（64KB 自转），含错误、len、head/tail 各 ~120 字节。用户拔卡把文件发回来即可定位，不用接串口。
+
+**发布**：`m5burner.json` → 0.2.3；老用户只刷 `papers3-weread-v0.2.3-app.bin`（0x10000，配置/登录态在 SD 不受影响），新用户用 `papers3-weread-v0.2.3-full.bin`（0x0），`firmware/papers3_weread_0x10000.bin` 已同步刷新。编译：RAM 27.5%，Flash 14.2%。
+
+**已知边界**：`shelf/sync` 无分页参数（koplugin API 文档 "Parameters: none"，`lastSort` 游标是 `/user/notebooks` 的），500 本约 1MB 只能全量拉（netapi 实测 ~70KB/s → 约 15s，20s 超时+重试可兜）；书架结果未落 SD 缓存（`PATH_BOOKSHELF` 定义了没用上），每次开机都全量拉取——弱网用户可加"拉取失败回退 SD 缓存"兜底（待做）。
+
+### ⚠️ 本轮实踩的发布/烧录坑（别再犯）
+
+1. **`merge_bin` 打 full.bin 绝不能显式指定 flash 模式**。PaperS3 是八线 PSRAM（qio_opi），flash 实际工作在 **DIO**（pio 产物头部第 2 字节 `0x02`）。`esptool.py merge_bin --flash_mode qio` 会把头部改写成 `0x00`(QIO) → 刷完看门狗死循环：`rst:0x7 (TG0WDT_SYS_RST)` 刷屏、应用零输出（bootloop 期约 1.2s/轮）。正确命令（keep 保留各段原始参数）：
+   ```bash
+   esptool.py --chip esp32s3 merge_bin -o papers3-weread-full.bin \
+     --flash_mode keep --flash_freq keep --flash_size keep \
+     0x0 .pio/build/PaperS3/bootloader.bin 0x8000 .pio/build/PaperS3/partitions.bin \
+     0x10000 .pio/build/PaperS3/firmware.bin
+   ```
+   检查方法：`xxd -l 8 full.bin` 第 3 字节必须是 `02`（DIO），是 `00`（QIO）就是坏的。
+2. **`write_flash` 显示 "Hash of data verified" ≠ 能启动**。hash 只证明写入与文件一致，不证明镜像可引导。发布前必须把 full.bin **原样刷回真机看一次开机**（本轮坏包就是只看了 hash 没看启动）。
+3. **排查 bootloop 先排除合并产物**：直接刷 pio 三件套（`write_flash 0x0 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin`）能启动 → 问题在合并参数，不在应用代码。
+4. **"清空机器"要清两个地方**：`erase_flash` 只擦 Flash（NVS/SPIFFS/app），**擦不到 TF 卡**；WiFi+cookie 在 SD `/weread/config.json`，须串口发 `CFG {}`（loop 里处理，写完回 `[cfg] 已写入`）。只 erase 不清卡，开机照样自动连 WiFi 登录。
+5. **串口识别**：PaperS3 插 Mac 是 `/dev/cu.usbmodem2101`（USB Serial/JTAG，ROM 与应用日志同口）。原生 USB 打开串口**不一定复位**设备——设备在主循环静默时打开端口可能无任何输出，发 `s` 等命令试探即可，看到 ROM 刷屏才是在重启循环。

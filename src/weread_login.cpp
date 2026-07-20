@@ -2,6 +2,7 @@
 #include "weread_login.h"
 #include "weread_client.h"
 #include "config.h"
+#include "storage.h"
 #include <ArduinoJson.h>
 
 namespace weread_login {
@@ -14,6 +15,13 @@ static String jstr(JsonVariantConst v) {
     return "";
 }
 
+// 响应开头（数据可能在 PSRAM，按长度拼，不依赖 \0 结尾）
+static String resp_head(const HttpResponse& r, size_t n = 160) {
+    String s = "head=";
+    s.concat(r.data(), r.length() < n ? r.length() : n);
+    return s;
+}
+
 bool run(std::function<void(const String& url, const String& status)> render_qr,
          std::function<void(const String&, const String&, const String&)> msg,
          unsigned long timeout_ms) {
@@ -23,19 +31,26 @@ bool run(std::function<void(const String& url, const String& status)> render_qr,
     HttpResponse r = WR.get(String(WEREAD_HOST_WEB) + "/api/auth/getLoginUid");
     if (!r.ok()) {
         Serial.printf("[login] getLoginUid 失败 status=%d err=%s\n", r.status, r.error.c_str());
-        msg("登录失败", "拿不到 uid", "点按重试");
+        storage_debug_log("getLoginUid 失败 status=" + String(r.status) + " err=" + r.error);
+        // status=-1 是传输层失败（DNS/TCP/TLS），>0 是服务器拒绝
+        msg("登录失败", r.status > 0 ? String("服务器繁忙 HTTP ") + r.status
+                                     : "网络不通请检查网络", "点按重试");
         return false;
     }
     JsonDocument doc;
     if (deserializeJson(doc, r.data(), r.length())) {
         Serial.println("[login] getLoginUid JSON 解析失败");
-        msg("登录失败", "拿不到 uid", "点按重试");
+        storage_debug_log("getLoginUid 解析失败 " + resp_head(r));
+        msg("登录失败", "服务器返回异常", "点按重试");
         return false;
     }
     String uid = jstr(doc["uid"]); // 顶层 uid 或 data.uid
     if (!uid.length()) uid = jstr(doc["data"]["uid"]);
     if (!uid.length()) {
-        msg("登录失败", "拿不到 uid", "点按重试");
+        // 旧版这里无日志，三种失败共用一句"拿不到 uid"，无法定位
+        Serial.printf("[login] getLoginUid 响应无 uid: %.160s\n", r.data());
+        storage_debug_log("getLoginUid 无 uid " + resp_head(r));
+        msg("登录失败", "服务器返回异常", "点按重试");
         return false;
     }
     Serial.printf("[login] uid=%s\n", uid.c_str());

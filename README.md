@@ -125,6 +125,17 @@ pio run                  # 编译
 pio run -t upload --upload-port /dev/cu.usbmodem2101   # 烧录（端口按实际）
 ```
 
+打发布用的整片包（full.bin）：
+
+```bash
+# 必须 keep：不能显式指定 --flash_mode！PaperS3 八线 PSRAM，flash 工作在 DIO，
+# 显式 qio 会把 bootloader 头部改坏 → 看门狗死循环。打完用 xxd -l 8 检查第 3 字节须为 02。
+python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
+  -o papers3-weread-full.bin --flash_mode keep --flash_freq keep --flash_size keep \
+  0x0 .pio/build/PaperS3/bootloader.bin 0x8000 .pio/build/PaperS3/partitions.bin \
+  0x10000 .pio/build/PaperS3/firmware.bin
+```
+
 框架：Arduino + ESP-IDF 混合（PlatformIO `espressif32@6.13.0`）。依赖自动拉取（M5Unified / M5GFX / ArduinoJson / TJpg_Decoder / PNGdec / unzipLIB / AnimatedGIF）。
 
 ## 常见问题

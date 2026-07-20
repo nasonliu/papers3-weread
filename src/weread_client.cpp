@@ -37,7 +37,13 @@ struct RespBuf {
     char* psbuf = nullptr;   // PSRAM 接收缓冲
     size_t pslen = 0;        // 已写入长度
     size_t pscap = 0;        // 缓冲容量
+    bool overflow = false;   // 扩容到顶仍放不下 → 数据被截断，不能当成功响应用
 };
+
+// 接收缓冲：初始 512KB，不够按需翻倍，上限 4MB（PSRAM 共 8MB）
+// 旧版固定 512KB 静默丢字节 → 大书架（几百本书）JSON 被齐截，解析必报 IncompleteInput
+#define HTTP_BUF_INIT (512 * 1024)
+#define HTTP_BUF_MAX  (4 * 1024 * 1024)
 
 static esp_err_t http_event_handler(esp_http_client_event_t* evt) {
     RespBuf* rb = (RespBuf*)evt->user_data;
@@ -46,9 +52,27 @@ static esp_err_t http_event_handler(esp_http_client_event_t* evt) {
             if (rb && evt->data_len > 0) {
                 // 优先写 PSRAM buffer
                 if (rb->psbuf) {
+                    size_t need = rb->pslen + evt->data_len;
+                    if (need > rb->pscap) { // 放不下 → 翻倍扩容（封顶 HTTP_BUF_MAX）
+                        size_t newcap = rb->pscap;
+                        while (newcap < need && newcap < HTTP_BUF_MAX) newcap *= 2;
+                        if (newcap > HTTP_BUF_MAX) newcap = HTTP_BUF_MAX;
+                        if (newcap >= need) {
+                            char* nb = (char*)heap_caps_realloc(rb->psbuf, newcap, MALLOC_CAP_SPIRAM);
+                            if (nb) {
+                                Serial.printf("[http] 接收缓冲扩容 %u→%u KB\n",
+                                              (unsigned)(rb->pscap / 1024), (unsigned)(newcap / 1024));
+                                rb->psbuf = nb; rb->pscap = newcap;
+                            } else {
+                                Serial.printf("[http] PSRAM 扩容到 %u KB 失败\n", (unsigned)(newcap / 1024));
+                            }
+                        }
+                    }
                     if (rb->pslen + evt->data_len <= rb->pscap) {
                         memcpy(rb->psbuf + rb->pslen, evt->data, evt->data_len);
                         rb->pslen += evt->data_len;
+                    } else {
+                        rb->overflow = true; // 到顶仍放不下：宁可报错，绝不静默截断
                     }
                 } else if (rb->body) {
                     rb->body->concat((const char*)evt->data, evt->data_len);
@@ -214,10 +238,9 @@ HttpResponse WereadClient::request(const String& method, const String& url, cons
         rb.body = &resp.body;
         rb.headers = &resp.headers;
 
-        // 预分配 PSRAM 接收缓冲（大 JSON 避免 String 64KB bug）。给 512KB 足够书架 157KB
-        const size_t BUFCAP = 512 * 1024;
-        char* psbuf = (char*)heap_caps_malloc(BUFCAP, MALLOC_CAP_SPIRAM);
-        if (psbuf) { rb.psbuf = psbuf; rb.pscap = BUFCAP; rb.pslen = 0; }
+        // 预分配 PSRAM 接收缓冲（大 JSON 避免 String 64KB bug），不够时事件回调里翻倍扩
+        char* psbuf = (char*)heap_caps_malloc(HTTP_BUF_INIT, MALLOC_CAP_SPIRAM);
+        if (psbuf) { rb.psbuf = psbuf; rb.pscap = HTTP_BUF_INIT; rb.pslen = 0; }
 
         esp_http_client_config_t cfg = {};
         cfg.url = u.c_str();
@@ -254,13 +277,22 @@ HttpResponse WereadClient::request(const String& method, const String& url, cons
         }
         esp_http_client_cleanup(client);
 
+        // 缓冲扩容到顶仍放不下：当传输失败处理，绝不把截断的半个 JSON 交给调用方
+        if (rb.overflow) {
+            Serial.printf("[http] 响应超 %u KB 上限被截断 url=%s\n",
+                          (unsigned)(rb.pscap / 1024), u.c_str());
+            resp.error = "response too large";
+            resp.status = -1;
+        }
+
         // 接收结果挂到 resp：用了 PSRAM 就转移所有权，否则保持 String
-        if (psbuf && rb.pslen > 0) {
-            if (rb.pslen < rb.pscap) psbuf[rb.pslen] = '\0'; // 补结尾，data() 可安全 strstr
-            resp.psbody = psbuf;
+        // 注意回调可能已扩容搬移缓冲，必须用 rb.psbuf（不是分配时的旧 psbuf 指针）
+        if (rb.psbuf && rb.pslen > 0) {
+            if (rb.pslen < rb.pscap) rb.psbuf[rb.pslen] = '\0'; // 补结尾，data() 可安全 strstr
+            resp.psbody = rb.psbuf;
             resp.pslen = rb.pslen;
-        } else if (psbuf) {
-            heap_caps_free(psbuf); // 没收到数据，释放
+        } else if (rb.psbuf) {
+            heap_caps_free(rb.psbuf); // 没收到数据，释放
         }
         absorbSetCookie(resp);
         return resp;

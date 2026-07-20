@@ -15,3 +15,8 @@ bool storage_sd_ok();
 // 打开配置文件：读时 SD 优先、缺失回退 SPIFFS（兼容旧配置）；写时 SD 在就只写 SD
 File open_config_read();
 File open_config_write();
+
+// 追加一行诊断日志到 SD 卡 /weread/debug.log（SD 不在时静默跳过）。
+// 超 64KB 自动清零重写。用于抓用户现场：登录/书架等失败时把关键信息落卡，
+// 用户把 TF 卡里的这个文件发回来即可定位，不用接串口。
+void storage_debug_log(const String& line);

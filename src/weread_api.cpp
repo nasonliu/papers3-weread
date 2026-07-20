@@ -3,6 +3,7 @@
 #include "weread_client.h"
 #include "weread_crypto.h"
 #include "config.h"
+#include "storage.h"
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
 #include <mbedtls/sha256.h>
@@ -20,20 +21,57 @@ using PsramJsonDocument = BasicJsonDocument<PsramAllocator>;
 
 namespace weread_api {
 
+// 完整 JSON 必以 } 收尾。TCP 有序送达：拿到结尾字节 = 前面一字节没丢；
+// 尾巴不在 = 被截断（弱网断流/缓冲截断），重试一次大多能恢复
+static bool json_tail_complete(const HttpResponse& r) {
+    size_t n = r.length();
+    while (n > 0) {
+        char c = r.data()[n - 1];
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') { n--; continue; }
+        return c == '}';
+    }
+    return false;
+}
+
+// 失败现场落 SD：用户把 TF 卡 /weread/debug.log 发回来即可定位，不用接串口
+static void shelf_debug_dump(const HttpResponse& r, const String& err) {
+    size_t len = r.length();
+    String s = "shelf 失败 err=" + err + " len=" + String(len) + " head=";
+    s.concat(r.data(), len < 120 ? len : 120);
+    if (len > 100) { s += " tail="; s.concat(r.data() + len - 100, 100); }
+    storage_debug_log(s);
+}
+
 // ---- 书架 ----
 // 正确接口：GET https://weread.qq.com/web/shelf/sync（cookie 明文 JSON）
 // books[] 含 bookId/title/author/cover/format
 bool getBookshelf(std::vector<BookEntry>& out, String& err) {
     out.clear();
-    HttpResponse r = WR.get(String(WEREAD_HOST_WEB) + "/web/shelf/sync");
-    if (!r.ok()) { err = "shelf/sync HTTP " + String(r.status) + " " + r.error; return false; }
 
-    // 调试：打印实际接收长度（PSRAM）、开头、结尾（确认 JSON 完整闭合）
-    Serial.printf("[shelf] 接收 len=%d (psram=%s) head=%.120s\n",
-                  (int)r.length(), r.psbody ? "是" : "否", r.data());
-    if (r.length() > 100) {
-        Serial.printf("[shelf] tail=%.100s\n", r.data() + r.length() - 100);
+    HttpResponse r; // 禁止拷贝，只能移动
+    int attempt = 0;
+    for (; attempt < 2; attempt++) {
+        r = WR.get(String(WEREAD_HOST_WEB) + "/web/shelf/sync");
+        if (!r.ok()) {
+            err = "shelf/sync HTTP " + String(r.status) + " " + r.error;
+            storage_debug_log("shelf HTTP 失败: " + err);
+            return false;
+        }
+        // 调试：打印实际接收长度（PSRAM）、开头、结尾（确认 JSON 完整闭合）
+        Serial.printf("[shelf] 接收 len=%d (psram=%s) head=%.120s\n",
+                      (int)r.length(), r.psbody ? "是" : "否", r.data());
+        if (r.length() > 100) {
+            Serial.printf("[shelf] tail=%.100s\n", r.data() + r.length() - 100);
+        }
+        if (json_tail_complete(r)) break;
+        Serial.printf("[shelf] 响应不完整（第 %d 次）%s\n", attempt + 1, attempt ? "" : "，重试一次");
     }
+    if (!json_tail_complete(r)) {
+        err = "shelf JSON 解析失败: IncompleteInput";
+        shelf_debug_dump(r, err);
+        return false;
+    }
+    if (attempt > 0) storage_debug_log("shelf 第 2 次请求成功 len=" + String(r.length()));
 
     // 用 PSRAM JsonDocument + filter 只留需要字段
     JsonDocument filter;
@@ -49,11 +87,20 @@ bool getBookshelf(std::vector<BookEntry>& out, String& err) {
     filter["errcode"] = true;   // -2012 检查用；服务器两种字段名都有
     filter["errCode"] = true;
 
-    PsramJsonDocument doc(64 * 1024); // PSRAM 分配 64KB（filter 后 115 本书足够）
+    // 容量按响应长度给：实测过滤后约为输入一半（157KB→64KB）。
+    // 旧版固定 64KB，500+ 本书的用户必报 NoMemory
+    size_t cap = r.length() / 2;
+    if (cap < 64 * 1024) cap = 64 * 1024;
+    if (cap > 1024 * 1024) cap = 1024 * 1024;
+    PsramJsonDocument doc(cap);
     DeserializationError derr = deserializeJson(doc, r.data(), r.length(),
                                                 DeserializationOption::Filter(filter));
-    if (derr) { err = String("shelf JSON 解析失败: ") + derr.c_str(); return false; }
-    Serial.printf("[shelf] 解析成功 已用内存=%d\n", doc.memoryUsage());
+    if (derr) {
+        err = String("shelf JSON 解析失败: ") + derr.c_str();
+        shelf_debug_dump(r, err);
+        return false;
+    }
+    Serial.printf("[shelf] 解析成功 容量=%d\n", (int)cap);
 
     // -2012 登录超时检查（注意服务器两种字段名都有：errcode / errCode）
     int ec = 0;
