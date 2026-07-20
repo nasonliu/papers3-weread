@@ -136,6 +136,8 @@ python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bi
   0x10000 .pio/build/PaperS3/firmware.bin
 ```
 
+GitHub Release 只挂这一个 `papers3-weread-full.bin` 即可（M5Burner 自定义刷机要整片单文件），不要再放分开的 app.bin。
+
 框架：Arduino + ESP-IDF 混合（PlatformIO `espressif32@6.13.0`）。依赖自动拉取（M5Unified / M5GFX / ArduinoJson / TJpg_Decoder / PNGdec / unzipLIB / AnimatedGIF）。
 
 ## 常见问题

@@ -887,3 +887,4 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 3. **排查 bootloop 先排除合并产物**：直接刷 pio 三件套（`write_flash 0x0 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin`）能启动 → 问题在合并参数，不在应用代码。
 4. **"清空机器"要清两个地方**：`erase_flash` 只擦 Flash（NVS/SPIFFS/app），**擦不到 TF 卡**；WiFi+cookie 在 SD `/weread/config.json`，须串口发 `CFG {}`（loop 里处理，写完回 `[cfg] 已写入`）。只 erase 不清卡，开机照样自动连 WiFi 登录。
 5. **串口识别**：PaperS3 插 Mac 是 `/dev/cu.usbmodem2101`（USB Serial/JTAG，ROM 与应用日志同口）。原生 USB 打开串口**不一定复位**设备——设备在主循环静默时打开端口可能无任何输出，发 `s` 等命令试探即可，看到 ROM 刷屏才是在重启循环。
+6. **Release 资产只放 `papers3-weread-full.bin`（整片包）**。M5Burner 自定义刷机只能刷单文件整片包，分开的 app.bin 对用户没用，以后 Release 不再放（v0.2.3 起定的规矩；v0.2.3 里那个 app.bin 是最后一批）。打包包法见上面第 1 条。
