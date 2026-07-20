@@ -769,8 +769,8 @@ static void render_book_detail() {
     g_screen = SCR_BOOK;
     canvas.fillSprite(TFT_WHITE);
     BookEntry& b = g_cur_book;
-    String title = g_detail.title.length() ? g_detail.title : b.title;
-    String author = g_detail.author.length() ? g_detail.author : b.author;
+    String title = g_detail.title.length() ? g_detail.title : b.title.c_str();
+    String author = g_detail.author.length() ? g_detail.author : b.author.c_str();
 
     drawUI("书籍详情", 20, 16);
     drawUI("返回", SCREEN_W - 20 - textWidthUI("返回"), 16);

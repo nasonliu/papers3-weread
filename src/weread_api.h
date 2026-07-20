@@ -1,26 +1,71 @@
 // weread_api.h — 微信读书接口封装
 #pragma once
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 #include <vector>
 
+// PSRAM 字符串：书架/章节等大列表的文本字段放 PSRAM，不碰内部 DRAM。
+// 教训（v0.2.4）：500 本书 × 6 个 Arduino String ≈ 100-140KB 内部 DRAM，
+// 把 320KB DRAM 吃光 → WiFi 驱动 m f null、DNS/TCP 全瘫（封面/详情/上传全挂）。
+// 注意：必须用 IDF 的 heap_caps_malloc(MALLOC_CAP_SPIRAM)，不能用 Arduino 的
+// ps_malloc()——本构建（qio_opi）里 Arduino 的 spiramDetected 标志未置位，
+// ps_malloc 恒返回 NULL（真机实测：赋值后 len=0、PSRAM 余量不变），全部字段变空串。
+class PsString {
+public:
+    PsString() = default;
+    PsString(const char* s) { set(s); }
+    PsString(const String& s) { set(s.c_str()); }
+    ~PsString() { clear(); }
+    PsString(const PsString& o) { set(o.buf_); }
+    PsString& operator=(const PsString& o) { if (this != &o) set(o.buf_); return *this; }
+    PsString& operator=(const char* s) { set(s); return *this; }
+    PsString& operator=(const String& s) { set(s.c_str()); return *this; }
+    PsString(PsString&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    PsString& operator=(PsString&& o) noexcept {
+        if (this != &o) { clear(); buf_ = o.buf_; o.buf_ = nullptr; }
+        return *this;
+    }
+
+    void set(const char* s) {
+        clear();
+        if (!s || !*s) return;
+        size_t n = strlen(s) + 1;
+        buf_ = (char*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM); // 失败则保持空，c_str() 回 ""
+        if (buf_) memcpy(buf_, s, n);
+    }
+    void clear() { if (buf_) { heap_caps_free(buf_); buf_ = nullptr; } }
+
+    const char* c_str() const { return buf_ ? buf_ : ""; }
+    size_t length() const { return buf_ ? strlen(buf_) : 0; }
+    bool isEmpty() const { return !buf_ || !*buf_; }
+    // 与 String/const char* 比较（c_str() 永不为 null）
+    bool operator==(const PsString& o) const { return strcmp(c_str(), o.c_str()) == 0; }
+    bool operator!=(const PsString& o) const { return !(*this == o); }
+    // 隐式转 String：UI/接口大多吃 String，转换时产生临时拷贝（量少，可接受）
+    operator String() const { return String(c_str()); }
+
+private:
+    char* buf_ = nullptr;
+};
+
 struct BookEntry {
-    String bookId;
-    String title;
-    String author;
-    String cover;
-    String format;      // "epub" 或 "txt"（可能为空）
+    PsString bookId;
+    PsString title;
+    PsString author;
+    PsString cover;
+    PsString format;    // "epub" 或 "txt"（可能为空）
     int progress = 0;   // 阅读进度百分比（来自 shelf/sync 的 bookProgress[]）
-    String progressChapterUid;   // 进度所在章节 chapterUid（bookProgress[]，可能为空）
+    PsString progressChapterUid;   // 进度所在章节 chapterUid（bookProgress[]，可能为空）
     uint32_t readUpdateTime = 0; // 最近阅读时间 unix 秒（bookProgress[].updateTime）
 };
 
 struct ChapterEntry {
-    String chapterUid;
-    String title;
+    PsString chapterUid;
+    PsString title;
     int chapterIdx = 0;
     int wordCount = 0;
     bool paid = false;
-    String tar;         // 本章资源 tar 包 URL（chapterInfos 的 tar 字段，插图等资源；可能为空）
+    PsString tar;       // 本章资源 tar 包 URL（chapterInfos 的 tar 字段，插图等资源；可能为空）
 };
 
 // 书籍详情（weread.qq.com/web/book/info 实测：i.weread/book/info 需签名返回 401）

@@ -1,6 +1,6 @@
 # PaperS3 微信读书阅读器 — 项目进度 / 交接文档
 
-> 最后更新：2026-07-20（大书架截断修复 + 失败现场 SD 落盘，v0.2.3）
+> 最后更新：2026-07-20（500 本书吃光内部 DRAM 修复 + ps_malloc NULL 坑，v0.2.4）
 > 状态：**功能全链路可用并已发布 v0.1.0**（GitHub: nasonliu/papers3-weread）。**ESP32 访问 weread 接口间歇性 TCP 连接失败的底层根因仍未闭环；已另外确认同步网络重试会把偶发失败放大成数分钟的界面“卡住”**（见第〇节）。
 
 ---
@@ -888,3 +888,22 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 4. **"清空机器"要清两个地方**：`erase_flash` 只擦 Flash（NVS/SPIFFS/app），**擦不到 TF 卡**；WiFi+cookie 在 SD `/weread/config.json`，须串口发 `CFG {}`（loop 里处理，写完回 `[cfg] 已写入`）。只 erase 不清卡，开机照样自动连 WiFi 登录。
 5. **串口识别**：PaperS3 插 Mac 是 `/dev/cu.usbmodem2101`（USB Serial/JTAG，ROM 与应用日志同口）。原生 USB 打开串口**不一定复位**设备——设备在主循环静默时打开端口可能无任何输出，发 `s` 等命令试探即可，看到 ROM 刷屏才是在重启循环。
 6. **Release 资产只放 `papers3-weread-full.bin`（整片包）**。M5Burner 自定义刷机只能刷单文件整片包，分开的 app.bin 对用户没用，以后 Release 不再放（v0.2.3 起定的规矩；v0.2.3 里那个 app.bin 是最后一批）。打包包法见上面第 1 条。
+
+---
+
+## 十六、500 本书吃光内部 DRAM + ps_malloc 恒 NULL 坑（2026-07-20，v0.2.4）
+
+**症状**（500 本书用户）：书架能进，但封面全"无封面"、点书进不了详情页、进度上传失败——**持续必现**，与网络时段无关。该用户 v0.2.3 之前是"shelf JSON 解析失败"（截断），截断修好后书架终于能加载，才暴露出这个更深的雷。
+
+**确诊路径**（netdiag 是内存类问题的第一指标）：
+- `netdiag`：`internal heap=5463`（健康 ~60KB）、RSSI=0、DNS 全灭（仅缓存命中可解析）、TCP connect 瞬间 `EHOSTUNREACH`、WiFi 驱动狂刷 `m f null`（malloc 失败）
+- 串口 `books`：书架 489 本在内存里 → 489 × 6 个 Arduino String 字段（书名/作者/封面URL/格式等，String 缓冲只走内部 DRAM）≈ 100-140KB，把 320KB DRAM 吃光 → lwIP/mbedTLS/WiFi 全饿死 → 一切网络操作全挂
+
+**修复**：新增 `PsString`（`weread_api.h`），`BookEntry`（6 个字段）与 `ChapterEntry`（chapterUid/title/tar）全部改 PSRAM 存储；带隐式 `operator String()`，调用点几乎不用改。1281 章长书目录同样受益。
+
+**⚠️ 大坑：Arduino `ps_malloc()` 在本构建（qio_opi）恒返回 NULL**。
+真机现象：赋值后 `len=0`、PSRAM 余量纹丝不动（`esp32-hal-psram.c` 里 `ps_malloc` 被 `spiramDetected` 门控，该标志在本构建未置位；而 IDF 层 `heap_caps_malloc(MALLOC_CAP_SPIRAM)` 一直正常——PsramAllocator、HTTP 接收缓冲都走它）。表现为 JSON 解析成功但循环 push 0/489 → "书架为空或解析无 books"。**PSRAM 分配一律用 IDF `heap_caps_malloc`，别用 Arduino 的 `ps_malloc`**（释放用 `heap_caps_free`）。
+
+**真机验证（v0.2.4，500 本账号）**：489/489 入列；internal heap 回升到 78-82KB（比之前 115 本时的 ~60KB 还好，因为书架字符串全走了 PSRAM）；详情页正常打开；《第一序列》1281 章目录加载 OK；netdiag 全绿（DNS/TCP/TLS 全通）。
+
+**版本**：m5burner.json → 0.2.4；发布物按新规矩只有整片 `papers3-weread-full.bin`（merge_bin keep 参数，头部 DIO）。

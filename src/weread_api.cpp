@@ -109,15 +109,17 @@ bool getBookshelf(std::vector<BookEntry>& out, String& err) {
     if (ec == -2012) { err = "cookie 过期(-2012)"; return false; }
 
     JsonArray books = doc["books"].as<JsonArray>();
-    Serial.printf("[shelf] books 数组大小=%d 已用内存=%d\n", books.size(), doc.memoryUsage());
+    Serial.printf("[shelf] books 数组大小=%d\n", books.size());
+    int pushed = 0;
     for (JsonObject b : books) {
         BookEntry be;
         be.bookId = b["bookId"].as<String>();
         be.title  = b["title"].as<String>();
         be.author = b["author"].as<String>();
         be.cover  = b["cover"].as<String>();
-        if (be.bookId.length()) out.push_back(be);
+        if (be.bookId.length()) { out.push_back(be); pushed++; }
     }
+    Serial.printf("[shelf] push 成功 %d/%d\n", pushed, (int)books.size());
     if (out.empty()) { err = "书架为空或解析无 books"; return false; }
 
     // 合并 bookProgress[] 的阅读进度（实测 chapterUid 为数字，兼容字符串）
