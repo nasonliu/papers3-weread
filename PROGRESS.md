@@ -1,7 +1,7 @@
 # PaperS3 微信读书阅读器 — 项目进度 / 交接文档
 
-> 最后更新：2026-07-20（页间断行根因修复 + 长书 reader 截断修复，v0.2.7）
-> 状态：**功能全链路可用并已发布 v0.1.0**（GitHub: nasonliu/papers3-weread）。**ESP32 访问 weread 接口间歇性 TCP 连接失败的底层根因仍未闭环；已另外确认同步网络重试会把偶发失败放大成数分钟的界面“卡住”**（见第〇节）。
+> 最后更新：2026-07-21（WereadClient keep-alive 复用 + UI 假死修复，v0.2.8）
+> 状态：**功能全链路可用并已发布 v0.1.0**（GitHub: nasonliu/papers3-weread）。**ESP32 访问 weread 接口间歇性 TCP 连接失败的底层根因仍未闭环；v0.2.8 已消除同步网络重试放大成数分钟界面"卡住"的问题**（见第〇节）。
 
 ---
 
@@ -58,15 +58,16 @@
 ### 当前判断与下一步
 
 - 历史上的 `mbedtls_ssl_setup -0x7F00` 本地 DRAM 问题已经由 PSRAM allocator 修复；本轮未再出现。
-- 尚不能把剩余间歇性 TCP 失败归因到单一因素。当前较可信的方向是：ESP32 的旧版 lwIP/mbedTLS 直连路径，加上普通 API 频繁新建 TLS，放大了偶发路由/TCP/TLS失败；手机热点 A/B 仍是必要的路径对照。
+- ~~尚不能把剩余间歇性 TCP 失败归因到单一因素。当前较可信的方向是：ESP32 的旧版 lwIP/mbedTLS 直连路径，加上普通 API 频繁新建 TLS，放大了偶发路由/TCP/TLS失败；手机热点 A/B 仍是必要的路径对照。~~
+- **v0.2.8 已修普通 API 连接复用**：`WereadClient` 改 keep-alive（同 host 复用一条 TLS），握手从每请求 1-2s 降到整会话 1 次；失败重建重试一次；闲置 30s 关闭；`in_use` 防护。netapi 10/10 全过（~1.6s/轮，纯传输时间，无握手抖动）。
+- **v0.2.8 已修 UI 假死**：整章 90s 总预算（`g_chapter_deadline`）；`download_all` 去掉外层整章重试（内层 `request_retry` 已够）；点取消置 `g_net_cancel`——进行中的 HTTP 完成后后续请求不再发起（最坏堵 1 个 20s 超时，不再数分钟）。
 - 下次真实失败窗口应先保持串口持续打开，依次跑 `netdiag 20`、`netapi 20` 并记录错误类别、耗时和内存，再决定是否重置。
-- 优先修 UI 假死：给整章设总时间预算，取消重复的整章外层重试或统一成单一重试预算，并让取消/心跳能在网络等待过程中生效。
-- 随后把普通 `WereadClient` 改为同 host 连接复用：失败时只重建一次，空闲超时关闭，并保留 `in_use` 防护。
 - 再在相同固件、相同测试命令下做家用 WiFi vs 手机热点 A/B；热点稳定只能说明路径/路由相关，热点同样失败才继续集中查 ESP32 TLS/lwIP。
 
 ### 受影响的功能 vs 不受影响
 - **不受影响（全好）**：SD 缓存过的书离线阅读、翻页（0.4-0.9s）、字体、休眠、配网门户、扫码登录、书架（缓存命中时）
-- **受影响**：新书的目录/详情/正文/插图/下载整本/进度上传——网络窗口期可能失败；下载整本等同步长操作还会因叠加重试表现为长时间界面无响应
+- **已改善（v0.2.8）**：新书的目录/详情/正文/插图/下载整本/进度上传——网络窗口期仍可能失败，但**不再因叠加重试表现为长时间界面无响应**；下载整本点取消后 20s 内响应
+- **仍受影响**：底层间歇性 TCP 失败根因未定位（待 A/B 热点对照）
 
 ---
 
@@ -972,3 +973,41 @@ python3 -c "import serial,time; s=serial.Serial('/dev/cu.usbmodem2101',115200,ti
 ### 排障工具沉淀
 
 `dbgch <bookId> <chapterUid>`（章节解码打印）、`dbgpages`（页边界断行检查）、`time`（时钟/签名）、`netdiag/netapi`（网络分层）、`[reader]/[txt]/[shelf]` 失败现场打印（hlen/head/MD5）。**方法论：服务端响应先用 curl/Python 参考实现拿"标准答案"，再决定怀疑设备哪一层。**
+
+---
+
+## 十九、WereadClient keep-alive 复用 + UI 假死修复（2026-07-21，v0.2.8）
+
+### WereadClient 普通 API 连接复用
+
+**背景**：书架/目录/详情/评论/续期/进度上传每次请求都新建 esp_http_client（DNS+TCP+TLS 握手 1-2s/次），故障暴露窗口大，也是间歇性 TCP 失败的放大器之一。
+
+**方案**（照搬 ShardSession 已验证的模式）：
+- host 固定 `weread.qq.com` 的请求走 keep-alive 会话：open 一次后 `set_url` 换路径复用同一 TLS 连接
+- `i.weread.qq.com` 等异 host 自动回退一次性 client（fallback 路径）
+- 失败 close 重建重试一次（与 ShardSession 一致）
+- `sess_in_use_` RAII 计数 + `sess_last_use_` 闲置 30s 由 `WR.housekeeping()` 关闭（防几条 keep-alive 长连接挤爆 DRAM）
+- 响应缓冲复用现有 `RespBuf`（PSRAM 512KB→4MB 扩容 + overflow 报错），会话级固定缓冲 `g_sess_rb`（esp_http_client 的 user_data 在 init 时绑定无法按请求改，故用静态缓冲每次请求重置，成功后转所有权——与 ShardSession 同规）
+
+**实测**：netapi 10/10 全过，每轮 ~1.6s（157KB 书架 JSON 纯传输时间），无握手抖动；internal ~82KB 稳定。
+
+**坑**：ESP-IDF 4.4.7 的 esp_http_client **没有 `esp_http_client_set_user_data`**（init 后 user_data 不可改）。不能用"每次请求换 user_data 指向当次 RespBuf"的方案，只能会话级固定缓冲。
+
+### UI 假死修复
+
+**背景**：单章最多串 4 个请求（reader + e_0/e_1/e_3），每个 20s 超时 × 内层 `request_retry` × 外层 `download_all` 整章重试，最坏堵数分钟；取消只在章节边界检查，无法中断进行中的 `esp_http_client_perform()`。
+
+**修复**：
+1. **整章 90s 总预算**：`fetch_chapter_raw` 开头设 `g_chapter_deadline = millis() + 90000`，每个请求前 `chapter_aborted()` 检查，超预算返回"整章超时"
+2. **去掉外层整章重试**：`download_all` 里 `delay(2000)` + 整章重试删掉（内层 `request_retry` 已够；外层重试是数分钟卡死的放大器）
+3. **取消在网络等待中生效**：全局 `volatile bool g_net_cancel`（weread_api 命名空间，main.cpp 点取消置位）
+   - `ShardSession::request_retry` 每次请求前检查，置位则不再发起新请求（status=-2）
+   - `fetch_chapter_raw` 每章开始清零（上次取消不残留）
+   - 进行中的 perform 无法打断，但后续请求不再发起——**最坏堵 1 个 HTTP 超时 20s，不再数分钟**
+   - `download_all` 点取消后置位 + 放锁等网络层退出（最多 25s）+ 恢复锁
+
+**边界**：ESP32 的 esp_http_client_perform 是阻塞调用，无法异步取消；本方案是"停止后续请求"而非"打断当前请求"，最坏情况仍需等当前请求超时（20s）。
+
+### 排障工具沉淀（复用）
+
+`netapi 10` 验证 keep-alive 效果：连续 10 轮书架请求全部 ~1.6s（无握手抖动即复用成功；若每次新建会有 1-2s TLS 抖动）。

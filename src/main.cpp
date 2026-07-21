@@ -976,10 +976,26 @@ static void download_all() {
     draw_download_progress(b.title, 0, total, 0); // 立即显示，别让用户等
     for (int i = 0; i < total; i++) {
         // 取消检测（触摸任务在后台填充队列）
+        // v0.2.8：点取消时置 g_net_cancel——进行中的 HTTP 请求完成后后续请求不再发起，
+        // 最坏堵 1 个 HTTP 超时（20s）而不是整章 4 请求 × 2 层重试（数分钟）
         TouchPoint pt;
         if (g_touch_q && xQueuePeek(g_touch_q, &pt, 0)) {
             xQueueReceive(g_touch_q, &pt, 0);
             xQueueReset(g_touch_q);
+            weread_api::g_net_cancel = true; // 通知网络层停止后续请求
+            net_unlock(); // 先放锁再等，让进行中的请求走完
+            // 等网络层退出（最多等一个 HTTP 超时周期 + 余量）
+            unsigned long wait0 = millis();
+            while (millis() - wait0 < 25000) {
+                delay(200);
+                // 锁可拿了 = 网络层已退出临界区
+                if (xSemaphoreTakeRecursive(g_net_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    xSemaphoreGiveRecursive(g_net_mtx);
+                    break;
+                }
+            }
+            net_lock(); // 恢复锁状态（后面 net_unlock 配对）
+            weread_api::g_net_cancel = false;
             screen_msg("下载已取消", b.title, String("已完成 ") + done + "/" + total);
             render_book_detail();
             return;
@@ -991,12 +1007,11 @@ static void download_all() {
             std::vector<ContentBlock> blocks;
             String err;
             net_lock();
-            if (!weread_api::getChapterBlocks(b.bookId, ch, blocks, err)) {
-                delay(2000); // 偶发连接失败重试一次
-                weread_api::getChapterBlocks(b.bookId, ch, blocks, err);
-            }
+            // v0.2.8：去掉外层整章重试（内层 request_retry 已够；外层重试是数分钟卡死的放大器）
+            // 失败章节记入失败列表，整本下载完后统一报告，不再原地死等
+            bool ok = weread_api::getChapterBlocks(b.bookId, ch, blocks, err);
             net_unlock();
-            if (!blocks.empty()) {
+            if (ok && !blocks.empty()) {
                 blocks_cache_save(b.bookId, ch.chapterUid, blocks);
                 done++; fetched++;
             } else {
@@ -2084,6 +2099,7 @@ void loop() {
         last_hk = millis();
         weread_api::housekeeping();
         img_render::housekeeping();
+        WR.housekeeping(); // v0.2.8：普通 API 会话也闲置关闭
     }
 
     // cookie 被服务器轮换后定期落盘（否则重启读旧 cookie → -2012 又要扫码）

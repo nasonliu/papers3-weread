@@ -21,6 +21,10 @@ using PsramJsonDocument = BasicJsonDocument<PsramAllocator>;
 
 namespace weread_api {
 
+// v0.2.8：全局取消标志（main.cpp 点取消置位；fetch_chapter_raw 每章开始清零）
+// 提前声明：ShardSession::request_retry 需要引用，定义在 stage_tick 附近
+volatile bool g_net_cancel = false;
+
 // 完整 JSON 必以 } 收尾。TCP 有序送达：拿到结尾字节 = 前面一字节没丢；
 // 尾巴不在 = 被截断（弱网断流/缓冲截断），重试一次大多能恢复
 static bool json_tail_complete(const HttpResponse& r) {
@@ -567,10 +571,13 @@ struct ShardSession {
     }
 
     // 带一次重建重试的请求：perform 失败（连接被断开等）→ 丢弃旧连接重建再试一次
+    // v0.2.8：取消标志置位时不再发起新请求（进行中的 perform 无法打断，但后续请求不发了）
     char* request_retry(bool post, const String& path, const String* body, const String& referer,
                         size_t& out_len, int& status) {
+        if (g_net_cancel) { status = -2; return nullptr; } // 已取消，不再发起
         char* d = request(post, path, body, referer, out_len, status);
         if (d) return d;
+        if (g_net_cancel) { status = -2; return nullptr; } // 第一次失败 + 已取消：不重建重试
         close(); // 连接已坏，丢弃重建（不卡死：最多两次尝试）
         Serial.println("[shard] 连接失败，丢弃重建重试");
         return request(post, path, body, referer, out_len, status);
@@ -600,10 +607,30 @@ static String g_psvts;       // 缓存的 psvts
 void (*chapter_stage_cb)(const char* stage, int cur, int total) = nullptr;
 static inline void stage_tick(const char* s, int c, int t) { if (chapter_stage_cb) chapter_stage_cb(s, c, t); }
 
+// ---- 整章总时间预算 + 取消标志（v0.2.8 UI 假死修复）----
+// 单章最多串 4 个请求（reader + e_0/e_1/e_3），每个 20s 超时 × 内层重试 × 外层重试
+// 最坏可堵数分钟。整章预算到点即返回失败；取消标志让用户点按后立即停止后续请求
+// （不能打断进行中的 perform，但下一请求不再发起——最坏堵 1 个 HTTP 超时 20s）。
+static unsigned long g_chapter_budget_ms = 90000; // 单章总预算 90s（可调）
+static unsigned long g_chapter_deadline = 0;      // 本章截止时间（fetch_chapter_raw 开头设）
+
+static inline bool chapter_over_budget() {
+    return g_chapter_deadline && (long)(millis() - g_chapter_deadline) > 0;
+}
+static inline bool chapter_aborted(String& err) {
+    if (g_net_cancel) { err = "已取消"; return true; }
+    if (chapter_over_budget()) { err = "整章超时（90s 预算）"; return true; }
+    return false;
+}
+
 // 成功返回 true：raw.kind 指示形态，raw.data/len 为 PSRAM 中的内容（TXT 纯文本 /
 // 单章 XHTML / 整本 EPUB zip），解码全程 PSRAM（避开 String 64KB 损坏）。
 // 本章所有请求（reader HTML + 分片）走同一条 keep-alive 连接（见 ShardSession 注释）
 static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, ChapterRaw& raw, String& err) {
+    // v0.2.8：整章时间预算（防 UI 假死）+ 取消标志
+    g_chapter_deadline = millis() + g_chapter_budget_ms;
+    g_net_cancel = false; // 每章开始清标志（上次取消不残留）
+
     String rurl = reader_url(bookId, ch.chapterUid); // 完整 URL，作 Referer
     // 会话内用相对路径（host 固定 weread.qq.com）
     String rpath = "/web/reader/" + weread::e(bookId);
@@ -615,6 +642,7 @@ static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, Chap
     bool from_cache = (g_psvts_book == bookId && g_psvts.length());
     if (from_cache) psvts = g_psvts;
     if (!psvts.length()) {
+        if (chapter_aborted(err)) return false; // 预算/取消检查
         stage_tick("reader", 1, 4);
         size_t hlen = 0;
         char* html = g_shard_sess.request_retry(false, rpath, nullptr, rurl, hlen, status);
@@ -651,6 +679,7 @@ static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, Chap
         stage_tick("e_0", 2, 4);
         d0 = g_shard_sess.request_retry(true, e0_path, &e0_body, rurl, n0, status);
     };
+    if (chapter_aborted(err)) return false;
     post_e0();
     if (!d0) { err = "e_0 请求失败"; return false; }
     // 缓存 psvts 失效的典型表现：HTTP 错误或返回 {}
@@ -713,8 +742,10 @@ static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, Chap
     if (is_txt) {
         char* t0 = nullptr; size_t tn0 = 0;
         char* t1 = nullptr; size_t tn1 = 0;
+        if (chapter_aborted(err)) { heap_caps_free(d0); return false; }
         stage_tick("t_0", 3, 4);
         post_shard("/web/book/chapter/t_0", t0, tn0);
+        if (chapter_aborted(err)) { heap_caps_free(d0); if (t0) heap_caps_free(t0); return false; }
         stage_tick("t_1", 4, 4);
         post_shard("/web/book/chapter/t_1", t1, tn1);
         heap_caps_free(d0); // e_0 元信息已无用（t 分支不再需要）
@@ -745,8 +776,10 @@ static bool fetch_chapter_raw(const String& bookId, const ChapterEntry& ch, Chap
     // 形态 C：常规 EPUB 分片 e_0+e_1+e_3 → 单章 XHTML（全 PSRAM，e_0 响应零复制复用）
     char* e1 = nullptr; size_t en1 = 0;
     char* e3 = nullptr; size_t en3 = 0;
+    if (chapter_aborted(err)) { heap_caps_free(d0); return false; }
     stage_tick("e_1", 3, 4);
     post_shard("/web/book/chapter/e_1", e1, en1);
+    if (chapter_aborted(err)) { heap_caps_free(d0); if (e1) heap_caps_free(e1); return false; }
     stage_tick("e_3", 4, 4);
     post_shard("/web/book/chapter/e_3", e3, en3);
     raw.data = weread::decode_content_shards_psram(d0, n0, e1, en1, e3, en3, &raw.len);

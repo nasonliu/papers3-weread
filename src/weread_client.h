@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <vector>
 #include <map>
+#include <esp_http_client.h>
 
 struct HttpResponse {
     int status = 0;
@@ -49,6 +50,9 @@ public:
     HttpResponse get(const String& url, const String& referer = "https://weread.qq.com/");
     HttpResponse postJson(const String& url, const String& jsonBody, const String& referer = "https://weread.qq.com/");
 
+    // 会话闲置关闭（主循环周期调用）：释放 keep-alive TLS 占用的 DRAM
+    void housekeeping();
+
     // 配置值（从配置文件读入）
     String wifi_ssid, wifi_pass;
     String cfg_wr_vid, cfg_wr_skey, cfg_wr_rt, cfg_api_key;
@@ -60,6 +64,24 @@ private:
     bool renewing_ = false;         // tryRenew 进行中（防 request 层自动续期递归）
     bool rt_dead_ = false;          // renewal 被服务器拒绝（wr_rt 已死，只能重扫码）
     unsigned long last_renew_fail_ = 0; // 上次续期失败时间（传输失败 30s、rt 死亡 10 分钟防抖）
+
+    // ---- keep-alive 会话（v0.2.8：普通 API 复用同一条 TLS 连接）----
+    // 与 ShardSession 同规：host 固定 weread.qq.com，open 一次后 set_url 换路径复用；
+    // perform 失败 close 重建重试一次；in_use RAII 计数 + last_use 闲置 30s 由 housekeeping 关。
+    // i.weread.qq.com 等异 host 请求自动回退到独立一次性 client（走 fallback 路径）。
+    // 会话固定响应缓冲（event_handler 的 user_data 在 init 时绑定，无法按请求改）；
+    // 每次请求前重置，成功后转所有权给 HttpResponse（与 ShardSession 同规）。
+    // 并发安全由 g_net_mtx 保证（所有 WR 调用方都持锁）。缓冲结构在 .cpp 静态持有。
+    esp_http_client_handle_t sess_ = nullptr;
+    unsigned long sess_last_use_ = 0;
+    volatile int sess_in_use_ = 0;
+    bool sessOpen_();
+    void sessClose_();
+    HttpResponse requestSess_(const String& method, const String& path, const String* body,
+                              const String& referer, const String& contentType);
+    HttpResponse requestOnce_(const String& method, const String& url, const String* body,
+                              const String& referer, const String& contentType);
+
     HttpResponse request(const String& method, const String& url, const String* body, const String& referer, const String& contentType);
     void absorbSetCookie(const HttpResponse& resp);
 };

@@ -230,73 +230,187 @@ void WereadClient::absorbSetCookie(const HttpResponse& resp) {
     }
 }
 
+// ---- keep-alive 会话（普通 API 用，与 ShardSession 同规）----
+// host 固定 weread.qq.com：书架/目录/详情/评论/续期/进度上传全走这一条 TLS 连接，
+// 握手从每请求 1 次（1-2s）降到整会话 1 次；失败 close 重建重试一次。
+
+// 会话响应缓冲：event_handler 的 user_data 在 init 时绑定无法按请求改，
+// 故用静态固定缓冲，每次请求前重置，成功后转所有权（与 ShardSession 同规）。
+static RespBuf g_sess_rb;
+
+bool WereadClient::sessOpen_() {
+    if (sess_) return true;
+    esp_http_client_config_t cfg = {};
+    cfg.host = "weread.qq.com";
+    cfg.path = "/";
+    cfg.transport_type = HTTP_TRANSPORT_OVER_SSL;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.timeout_ms = HTTP_TIMEOUT_MS;
+    cfg.buffer_size = 4096;
+    cfg.buffer_size_tx = 2048;
+    cfg.keep_alive_enable = true;
+    cfg.event_handler = http_event_handler; // 直接用主 handler（读 evt->user_data）
+    cfg.user_data = &g_sess_rb;             // init 时绑定，之后不可改
+    sess_ = esp_http_client_init(&cfg);
+    return sess_ != nullptr;
+}
+
+void WereadClient::sessClose_() {
+    if (sess_) { esp_http_client_cleanup(sess_); sess_ = nullptr; }
+}
+
+void WereadClient::housekeeping() {
+    if (sess_ && sess_in_use_ == 0 && millis() - sess_last_use_ > 30000) {
+        Serial.println("[wr] 会话闲置 30s，关闭释放内存");
+        sessClose_();
+    }
+}
+
+// 会话路径单次请求（不_retry）；path 为相对路径（如 "/web/shelf/sync"）
+HttpResponse WereadClient::requestSess_(const String& method, const String& path, const String* body,
+                                        const String& referer, const String& contentType) {
+    HttpResponse resp;
+    struct UseGuard { volatile int& c; UseGuard(volatile int& c_) : c(c_) { c++; } ~UseGuard() { c--; } } guard(sess_in_use_);
+
+    if (!sessOpen_()) { resp.error = "sess init failed"; resp.status = -1; return resp; }
+
+    // 重置会话缓冲（headers/PSRAM 指针指到当次 resp）
+    g_sess_rb.body = &resp.body;
+    g_sess_rb.headers = &resp.headers;
+    g_sess_rb.pslen = 0;
+    g_sess_rb.overflow = false;
+    if (!g_sess_rb.psbuf) {
+        g_sess_rb.psbuf = (char*)heap_caps_malloc(HTTP_BUF_INIT, MALLOC_CAP_SPIRAM);
+        if (!g_sess_rb.psbuf) { resp.error = "PSRAM 分配失败"; resp.status = -1; return resp; }
+        g_sess_rb.pscap = HTTP_BUF_INIT;
+    }
+
+    esp_http_client_set_url(sess_, path.c_str());
+    esp_http_client_set_method(sess_, method == "POST" ? HTTP_METHOD_POST : HTTP_METHOD_GET);
+    esp_http_client_set_header(sess_, "User-Agent", WEREAD_USER_AGENT);
+    esp_http_client_set_header(sess_, "Accept", "application/json, text/plain, */*");
+    esp_http_client_set_header(sess_, "Origin", "https://weread.qq.com");
+    esp_http_client_set_header(sess_, "Referer", referer.c_str());
+    String cookie = cookieHeader();
+    if (cookie.length()) esp_http_client_set_header(sess_, "Cookie", cookie.c_str());
+    if (body) {
+        esp_http_client_set_header(sess_, "Content-Type", contentType.c_str());
+        esp_http_client_set_post_field(sess_, body->c_str(), body->length());
+    } else {
+        esp_http_client_set_post_field(sess_, nullptr, 0); // 清掉上次 POST body
+    }
+
+    esp_err_t err = esp_http_client_perform(sess_);
+    if (err == ESP_OK) {
+        resp.status = esp_http_client_get_status_code(sess_);
+    } else {
+        resp.error = String(esp_err_to_name(err));
+        resp.status = -1;
+    }
+    sess_last_use_ = millis();
+
+    if (g_sess_rb.overflow) {
+        Serial.printf("[wr] 响应超 %u KB 上限被截断 path=%s\n",
+                      (unsigned)(g_sess_rb.pscap / 1024), path.c_str());
+        g_sess_rb.overflow = false;
+        resp.error = "response too large";
+        resp.status = -1;
+    }
+    // 成功收到数据：转所有权给 resp（g_sess_rb.psbuf 置空，下次请求重新分配）
+    if (resp.status > 0 && g_sess_rb.psbuf && g_sess_rb.pslen > 0) {
+        if (g_sess_rb.pslen < g_sess_rb.pscap) g_sess_rb.psbuf[g_sess_rb.pslen] = '\0';
+        resp.psbody = g_sess_rb.psbuf;
+        resp.pslen = g_sess_rb.pslen;
+        g_sess_rb.psbuf = nullptr;
+        g_sess_rb.pscap = 0;
+    }
+    absorbSetCookie(resp);
+    return resp;
+}
+
+// 一次性独立 client（fallback：异 host 如 i.weread.qq.com，或会话重建后仍失败的兜底）
+HttpResponse WereadClient::requestOnce_(const String& method, const String& url, const String* body,
+                                        const String& referer, const String& contentType) {
+    HttpResponse resp;
+    RespBuf rb;
+    rb.body = &resp.body;
+    rb.headers = &resp.headers;
+
+    char* psbuf = (char*)heap_caps_malloc(HTTP_BUF_INIT, MALLOC_CAP_SPIRAM);
+    if (psbuf) { rb.psbuf = psbuf; rb.pscap = HTTP_BUF_INIT; rb.pslen = 0; }
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = url.c_str();
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.event_handler = http_event_handler;
+    cfg.user_data = &rb;
+    cfg.timeout_ms = HTTP_TIMEOUT_MS;
+    cfg.buffer_size = 4096;
+    cfg.buffer_size_tx = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { resp.error = "init failed"; if (psbuf) heap_caps_free(psbuf); return resp; }
+
+    if (method == "POST") esp_http_client_set_method(client, HTTP_METHOD_POST);
+    else esp_http_client_set_method(client, HTTP_METHOD_GET);
+
+    esp_http_client_set_header(client, "User-Agent", WEREAD_USER_AGENT);
+    esp_http_client_set_header(client, "Accept", "application/json, text/plain, */*");
+    esp_http_client_set_header(client, "Origin", "https://weread.qq.com");
+    esp_http_client_set_header(client, "Referer", referer.c_str());
+    String cookie = cookieHeader();
+    if (cookie.length()) esp_http_client_set_header(client, "Cookie", cookie.c_str());
+    if (body) {
+        esp_http_client_set_header(client, "Content-Type", contentType.c_str());
+        esp_http_client_set_post_field(client, body->c_str(), body->length());
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        resp.status = esp_http_client_get_status_code(client);
+    } else {
+        resp.error = String(esp_err_to_name(err));
+        resp.status = -1;
+    }
+    esp_http_client_cleanup(client);
+
+    if (rb.overflow) {
+        Serial.printf("[wr] 响应超 %u KB 上限被截断 url=%s\n",
+                      (unsigned)(rb.pscap / 1024), url.c_str());
+        resp.error = "response too large";
+        resp.status = -1;
+    }
+    if (rb.psbuf && rb.pslen > 0) {
+        if (rb.pslen < rb.pscap) rb.psbuf[rb.pslen] = '\0';
+        resp.psbody = rb.psbuf;
+        resp.pslen = rb.pslen;
+    } else if (rb.psbuf) {
+        heap_caps_free(rb.psbuf);
+    }
+    absorbSetCookie(resp);
+    return resp;
+}
+
 HttpResponse WereadClient::request(const String& method, const String& url, const String* body,
                                    const String& referer, const String& contentType) {
+    // 自动路由：weread.qq.com 走 keep-alive 会话；异 host 走一次性 client
+    static const char* WEB_PREFIX = "https://weread.qq.com";
+    bool use_sess = url.startsWith(WEB_PREFIX);
+
     auto do_once = [&](const String& m, const String& u, const String* b,
                        const String& ref, const String& ct) -> HttpResponse {
-        HttpResponse resp;
-        RespBuf rb;
-        rb.body = &resp.body;
-        rb.headers = &resp.headers;
-
-        // 预分配 PSRAM 接收缓冲（大 JSON 避免 String 64KB bug），不够时事件回调里翻倍扩
-        char* psbuf = (char*)heap_caps_malloc(HTTP_BUF_INIT, MALLOC_CAP_SPIRAM);
-        if (psbuf) { rb.psbuf = psbuf; rb.pscap = HTTP_BUF_INIT; rb.pslen = 0; }
-
-        esp_http_client_config_t cfg = {};
-        cfg.url = u.c_str();
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
-        cfg.event_handler = http_event_handler;
-        cfg.user_data = &rb;
-        cfg.timeout_ms = HTTP_TIMEOUT_MS;
-        cfg.buffer_size = 4096;
-        cfg.buffer_size_tx = 2048;
-
-        esp_http_client_handle_t client = esp_http_client_init(&cfg);
-        if (!client) { resp.error = "init failed"; if (psbuf) heap_caps_free(psbuf); return resp; }
-
-        if (m == "POST") esp_http_client_set_method(client, HTTP_METHOD_POST);
-        else esp_http_client_set_method(client, HTTP_METHOD_GET);
-
-        esp_http_client_set_header(client, "User-Agent", WEREAD_USER_AGENT);
-        esp_http_client_set_header(client, "Accept", "application/json, text/plain, */*");
-        esp_http_client_set_header(client, "Origin", "https://weread.qq.com");
-        esp_http_client_set_header(client, "Referer", ref.c_str());
-        String cookie = cookieHeader();
-        if (cookie.length()) esp_http_client_set_header(client, "Cookie", cookie.c_str());
-        if (b) {
-            esp_http_client_set_header(client, "Content-Type", ct.c_str());
-            esp_http_client_set_post_field(client, b->c_str(), b->length());
+        if (use_sess) {
+            String path = u.substring(strlen(WEB_PREFIX)); // "/web/..." 部分
+            if (!path.length()) path = "/";
+            HttpResponse r = requestSess_(m, path, b, ref, ct);
+            if (r.status == -1) { // 连接级失败：丢弃重建再试一次（同 ShardSession）
+                Serial.println("[wr] 会话请求失败，重建连接重试");
+                sessClose_();
+                r = requestSess_(m, path, b, ref, ct);
+            }
+            return r;
         }
-
-        esp_err_t err = esp_http_client_perform(client);
-        if (err == ESP_OK) {
-            resp.status = esp_http_client_get_status_code(client);
-        } else {
-            resp.error = String(esp_err_to_name(err));
-            resp.status = -1;
-        }
-        esp_http_client_cleanup(client);
-
-        // 缓冲扩容到顶仍放不下：当传输失败处理，绝不把截断的半个 JSON 交给调用方
-        if (rb.overflow) {
-            Serial.printf("[http] 响应超 %u KB 上限被截断 url=%s\n",
-                          (unsigned)(rb.pscap / 1024), u.c_str());
-            resp.error = "response too large";
-            resp.status = -1;
-        }
-
-        // 接收结果挂到 resp：用了 PSRAM 就转移所有权，否则保持 String
-        // 注意回调可能已扩容搬移缓冲，必须用 rb.psbuf（不是分配时的旧 psbuf 指针）
-        if (rb.psbuf && rb.pslen > 0) {
-            if (rb.pslen < rb.pscap) rb.psbuf[rb.pslen] = '\0'; // 补结尾，data() 可安全 strstr
-            resp.psbody = rb.psbuf;
-            resp.pslen = rb.pslen;
-        } else if (rb.psbuf) {
-            heap_caps_free(rb.psbuf); // 没收到数据，释放
-        }
-        absorbSetCookie(resp);
-        return resp;
+        return requestOnce_(m, u, b, ref, ct);
     };
 
     HttpResponse resp = do_once(method, url, body, referer, contentType);

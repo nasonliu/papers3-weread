@@ -126,6 +126,10 @@ bool uploadProgress(const String& bookId, const String& chapterUid, int chapterI
 // 章节拉取进度回调（main.cpp 注入显示进度）：stage 如 "reader"/"e_0"/"e_1"/"e_3"/"t_0"/"t_1"
 extern void (*chapter_stage_cb)(const char* stage, int cur, int total);
 
+// v0.2.8：全局取消标志（main.cpp 下载整本点取消时置位，fetch_chapter_raw 每章开始清零）
+// 置位后：进行中的 esp_http_client_perform 无法打断，但后续请求不再发起（最坏堵 1 个 HTTP 超时）
+extern volatile bool g_net_cancel;
+
 // 会话闲置关闭（主循环周期调用）：释放 keep-alive TLS 占用的 DRAM，防后续连接内存不足
 void housekeeping();
 
