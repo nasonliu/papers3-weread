@@ -3,6 +3,7 @@
 // 成功后把 wifi_ssid/wifi_pass 写回配置（保留其它字段），展示结果约 3 秒后自动重启
 #include "provision.h"
 #include "storage.h"
+#include "weread_client.h" // v0.3.0：addWiFiToList 多账号
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -214,20 +215,9 @@ static void handle_not_found() {
     g_server.send(302, "text/plain", "");
 }
 
-// ---------------- 保存 WiFi 配置（保留原有全部字段，只改两项） ----------------
+// ---------------- 保存 WiFi 配置（保留原有全部字段，只改两项 + 追加 wifi_list） ----------------
 static bool save_wifi_config(const String& ssid, const String& pass) {
-    JsonDocument doc;
-    File f = open_config_read();
-    if (f) { deserializeJson(doc, f); f.close(); } // 没有文件/解析失败就从空配置开始
-    doc["wifi_ssid"] = ssid;
-    doc["wifi_pass"] = pass;
-    File w = open_config_write();
-    if (!w) {
-        Serial.println("[prov] 配置写入失败：无法打开配置文件");
-        return false;
-    }
-    serializeJson(doc, w);
-    w.close();
+    WereadClient::addWiFiToList(ssid, pass); // v0.3.0：追加进多账号列表（含兼容老字段）
     Serial.printf("[prov] WiFi 配置已保存（%s）: %s\n", storage_sd_ok() ? "SD 卡" : "SPIFFS", ssid.c_str());
     return true;
 }

@@ -110,6 +110,20 @@ bool WereadClient::loadConfig() {
 
     wifi_ssid   = doc["wifi_ssid"] | "";
     wifi_pass   = doc["wifi_pass"] | "";
+    // v0.3.0：多 WiFi 账号（wifi_list 数组 + 老格式单账号并入）
+    wifi_list.clear();
+    if (doc["wifi_list"].is<JsonArray>()) {
+        for (JsonObject ap : doc["wifi_list"].as<JsonArray>()) {
+            String s = ap["ssid"] | "", p = ap["pass"] | "";
+            if (s.length()) wifi_list.push_back({s, p});
+        }
+    }
+    // 老格式单账号并入列表（去重）
+    if (wifi_ssid.length()) {
+        bool found = false;
+        for (auto& ap : wifi_list) if (ap.first == wifi_ssid) { found = true; break; }
+        if (!found) wifi_list.push_back({wifi_ssid, wifi_pass});
+    }
     cfg_wr_vid  = doc["wr_vid"]  | "";
     cfg_wr_skey = doc["wr_skey"] | "";
     cfg_wr_rt   = doc["wr_rt"]   | "";
@@ -152,6 +166,73 @@ bool WereadClient::connectWiFi(unsigned long timeout_ms) {
     }
     Serial.println("[wifi] 连接超时");
     return false;
+}
+
+// v0.3.0：多 WiFi 账号——扫描可见 AP，按列表顺序连扫到的（10s/个）
+bool WereadClient::connectWiFiMulti(unsigned long per_ap_timeout_ms) {
+    if (wifi_list.empty()) { Serial.println("[wifi] 多账号列表为空"); return false; }
+
+    // NVS 初始化（同 connectWiFi）
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_ret = nvs_flash_init();
+    }
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+
+    // 扫描可见 AP
+    Serial.printf("[wifi] 扫描可见 AP（%d 个已存账号）...\n", (int)wifi_list.size());
+    int n = WiFi.scanNetworks();
+    Serial.printf("[wifi] 扫到 %d 个 AP\n", n);
+    if (n == 0) { Serial.println("[wifi] 无可见 AP"); return false; }
+
+    // 按列表顺序找第一个扫到的已存账号（只试第一个，避免逐个超时浪费时间）
+    for (auto& ap : wifi_list) {
+        for (int i = 0; i < n; i++) {
+            if (WiFi.SSID(i) == ap.first) {
+                Serial.printf("[wifi] 发现已存 AP: %s (RSSI=%d)，连接中\n", ap.first.c_str(), WiFi.RSSI(i));
+                WiFi.begin(ap.first.c_str(), ap.second.c_str());
+                unsigned long start = millis();
+                while (WiFi.status() != WL_CONNECTED && millis() - start < per_ap_timeout_ms) {
+                    delay(300); Serial.print(".");
+                }
+                Serial.println();
+                if (WiFi.status() == WL_CONNECTED) {
+                    wifi_ssid = ap.first; wifi_pass = ap.second; // 记住当前连的（CFG 导出用）
+                    Serial.printf("[wifi] 已连接 %s IP=%s RSSI=%d\n", ap.first.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                    return true;
+                }
+                Serial.printf("[wifi] 连接 %s 超时\n", ap.first.c_str());
+                return false; // 只试第一个扫到的，失败直接返回（用户可手动重连/配网）
+            }
+        }
+    }
+    Serial.println("[wifi] 可见 AP 里没有已存账号");
+    return false;
+}
+
+// 配网门户成功后把新账号追加进 wifi_list（去重），写回配置
+void WereadClient::addWiFiToList(const String& ssid, const String& pass) {
+    File f = open_config_read();
+    JsonDocument doc;
+    if (f) { deserializeJson(doc, f); f.close(); }
+    JsonArray arr = doc["wifi_list"].is<JsonArray>() ? doc["wifi_list"].as<JsonArray>() : doc["wifi_list"].to<JsonArray>();
+    // 去重（同 ssid 更新密码）
+    bool found = false;
+    for (JsonObject ap : arr) {
+        if (ap["ssid"] == ssid) { ap["pass"] = pass; found = true; break; }
+    }
+    if (!found) {
+        JsonObject ap = arr.add<JsonObject>();
+        ap["ssid"] = ssid; ap["pass"] = pass;
+    }
+    // 兼容老字段（当前连的）
+    doc["wifi_ssid"] = ssid; doc["wifi_pass"] = pass;
+    File wf = open_config_write();
+    if (wf) { serializeJson(doc, wf); wf.close(); }
+    Serial.printf("[wifi] 已存账号 +%s（共 %d 个）\n", ssid.c_str(), (int)arr.size());
 }
 
 void WereadClient::setCookie(const String& name, const String& value) {

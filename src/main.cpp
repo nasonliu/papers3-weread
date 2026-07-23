@@ -409,6 +409,8 @@ static void progress_save_local(const String& bookId, int ch_idx, int page) {
     if (f) { deserializeJson(doc, f); f.close(); }
     JsonObject o = doc[bookId].to<JsonObject>();
     o["c"] = ch_idx; o["p"] = page;
+    // v0.3.0：加存书名（离线书架兜底用，避免"未知书名"）
+    if (g_cur_book.bookId == bookId && g_cur_book.title.length()) o["t"] = g_cur_book.title;
     File w = SD.open("/weread/progress.json", "w");
     if (w) { serializeJson(doc, w); w.close(); }
 
@@ -628,6 +630,98 @@ static bool blocks_cache_exists(const String& bookId, const String& chapterUid) 
 
 // 整本下载完成标记：<bookId>/done.flag 存章节总数；与当前目录数一致才算"已下载"
 // （目录变多（出新章）则失效，按钮恢复可点，可补下载新章）
+// v0.3.0：书架列表缓存（离线模式用，在线拉书架成功后保存）
+static void shelf_cache_save() {
+    if (!storage_sd_ok() || g_shelf.empty()) return;
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (auto& b : g_shelf) {
+        JsonObject o = arr.add<JsonObject>();
+        o["id"] = b.bookId; o["t"] = b.title; o["a"] = b.author;
+        o["c"] = b.cover; o["f"] = b.format; o["p"] = b.progress;
+    }
+    File f = SD.open("/weread/shelf_cache.json", "w");
+    if (f) { serializeJson(doc, f); f.close(); }
+    Serial.printf("[缓存] 书架列表已保存（%d 本）\n", g_shelf.size());
+}
+
+// v0.3.0：离线模式书架——先读书架缓存（完整元数据），没有再扫 SD 缓存目录（兜底）
+static void shelf_load_offline() {
+    g_shelf.clear();
+    if (!storage_sd_ok()) { Serial.println("[离线] SD 不可用"); return; }
+    // 先读书架缓存（在线时保存的完整元数据）
+    File cf = SD.open("/weread/shelf_cache.json", "r");
+    if (cf) {
+        JsonDocument doc;
+        if (deserializeJson(doc, cf) == DeserializationError::Ok) {
+            for (JsonObject o : doc.as<JsonArray>()) {
+                BookEntry b;
+                b.bookId = o["id"] | "";
+                b.title = o["t"] | "未知书名";
+                b.author = o["a"] | "";
+                b.cover = o["c"] | "";
+                b.format = o["f"] | "epub";
+                b.progress = o["p"] | 0;
+                g_shelf.push_back(b);
+            }
+            cf.close();
+            Serial.printf("[离线] 书架缓存加载 %d 本\n", g_shelf.size());
+            return;
+        }
+        cf.close();
+    }
+    // 书架缓存没有/坏了：扫 SD 缓存目录兜底（只有已下载的书，元数据可能不全）
+    Serial.println("[离线] 无书架缓存，扫描已下载目录");
+    JsonDocument prog_doc;
+    File pf = SD.open("/weread/progress.json", "r");
+    if (pf) { deserializeJson(prog_doc, pf); pf.close(); }
+    File root = SD.open("/weread/cache");
+    if (!root) { Serial.println("[离线] 无缓存目录"); return; }
+    File dir = root.openNextFile();
+    while (dir) {
+        if (dir.isDirectory()) {
+            String bookId = String(dir.name()).substring(String("/weread/cache/").length());
+            String detail_path = String(dir.path()) + "/detail.json";
+            if (SD.exists(detail_path.c_str())) {
+                File f = SD.open(detail_path, "r");
+                if (f) {
+                    JsonDocument doc;
+                    if (deserializeJson(doc, f) == DeserializationError::Ok) {
+                        BookEntry b;
+                        b.bookId = bookId.c_str();
+                        b.title = doc["title"] | "";
+                        b.author = doc["author"] | "";
+                        b.cover = doc["cover"] | "";
+                        if (!b.title.length() && prog_doc[bookId].is<JsonObject>()) {
+                            b.title = prog_doc[bookId]["t"] | "";
+                        }
+                        if (!b.title.length()) b.title = "未知书名";
+                        String toc_path = String(dir.path()) + "/toc.json";
+                        if (SD.exists(toc_path.c_str())) {
+                            File tf = SD.open(toc_path, "r");
+                            if (tf) {
+                                JsonDocument tdoc;
+                                if (deserializeJson(tdoc, tf) == DeserializationError::Ok) {
+                                    b.format = tdoc["f"] | "epub";
+                                }
+                                tf.close();
+                            }
+                        }
+                        if (!b.format.length()) b.format = "epub";
+                        b.progress = 0;
+                        g_shelf.push_back(b);
+                    }
+                    f.close();
+                }
+            }
+        }
+        dir.close();
+        dir = root.openNextFile();
+    }
+    root.close();
+    Serial.printf("[离线] 扫描到 %d 本已下载的书\n", g_shelf.size());
+}
+
 static bool book_download_done(const String& bookId, int total) {
     if (!storage_sd_ok() || total <= 0) return false;
     File f = SD.open(book_cache_dir(bookId) + "/done.flag", "r");
@@ -762,6 +856,8 @@ static int shelf_row_h()    { return (SCREEN_H - 140) / SHELF_PER_PAGE; }
 
 // ---------- 全局弹出式菜单（v0.2.9：所有页面点右上角状态栏图标弹出 睡眠/WiFi/登录） ----------
 static bool g_popup_menu_open = false;
+// v0.3.0：离线模式（WiFi 连不上时进书架看缓存书，不自动重连）
+static bool g_offline_mode = false;
 
 // 前向声明（enter_sleep 在文件后面定义；shelf_relogin 66 行已声明；run_provisioning_portal 在 provision.h）
 static void enter_sleep();
@@ -769,6 +865,13 @@ static void enter_sleep();
 // 画弹出菜单（右上角下拉，覆盖在当前页面上，宽松间距）
 static void draw_popup_menu() {
     if (!g_popup_menu_open) return;
+    // v0.3.0：离线模式菜单项不同（重连 WiFi 替代重新登录）
+    const char* items[3];
+    if (g_offline_mode) {
+        items[0] = "睡眠"; items[1] = "重连 WiFi"; items[2] = "WiFi 配网";
+    } else {
+        items[0] = "睡眠"; items[1] = "WiFi 配网"; items[2] = "重新登录";
+    }
     const int MW = 160, MH = 3 * 56 + 24; // 菜单宽 160，3 行各 56 + 上下边距（宽松）
     const int MX = SCREEN_W - 20 - MW, MY = 50;
     // 白底黑框阴影
@@ -776,7 +879,6 @@ static void draw_popup_menu() {
     canvas.fillRoundRect(MX, MY, MW, MH, 10, TFT_WHITE);
     canvas.drawRoundRect(MX, MY, MW, MH, 10, TFT_BLACK);
     canvas.drawRoundRect(MX + 1, MY + 1, MW - 2, MH - 2, 9, TFT_BLACK); // 加粗边框
-    const char* items[3] = {"睡眠", "WiFi 配网", "重新登录"};
     for (int i = 0; i < 3; i++) {
         int iy = MY + 12 + i * 56;
         drawUI(items[i], MX + 24, iy + 12); // 左缩进 24，行内垂直居中（宽松）
@@ -793,20 +895,47 @@ static bool handle_popup_menu_touch(int x, int y) {
         g_popup_menu_open = false;
         return true; // 调用方重绘
     }
-    // 点菜单项
+    // 点菜单项（v0.3.0：离线模式菜单项不同）
     int row = (y - MY - 12) / 56;
-    if (row == 0) { // 睡眠
-        g_popup_menu_open = false;
-        Serial.println("[菜单] 睡眠");
-        enter_sleep();
-    } else if (row == 1) { // WiFi 配网
-        g_popup_menu_open = false;
-        Serial.println("[菜单] WiFi 配网");
-        run_provisioning_portal(screen_msg, ""); // 永不返回（成功后重启）
-    } else if (row == 2) { // 重新登录
-        g_popup_menu_open = false;
-        Serial.println("[菜单] 重新登录");
-        shelf_relogin();
+    if (g_offline_mode) {
+        if (row == 0) { // 睡眠
+            g_popup_menu_open = false;
+            Serial.println("[菜单] 睡眠");
+            enter_sleep();
+        } else if (row == 1) { // 重连 WiFi（手动触发，成功后退出离线模式）
+            g_popup_menu_open = false;
+            Serial.println("[菜单] 手动重连 WiFi");
+            screen_msg("正在重连 WiFi...", "扫描可见网络");
+            if (WR.connectWiFiMulti()) {
+                g_offline_mode = false;
+                Serial.println("[wifi] 重连成功，重启进在线模式");
+                screen_msg("WiFi 已连接", "重启加载书架");
+                delay(2000);
+                ESP.restart(); // 重启走正常启动流程（拉书架等）
+            } else {
+                Serial.println("[wifi] 重连失败，保持离线模式");
+                screen_msg("重连失败", "仍是离线模式");
+                delay(1000);
+            }
+        } else if (row == 2) { // WiFi 配网
+            g_popup_menu_open = false;
+            Serial.println("[菜单] WiFi 配网");
+            run_provisioning_portal(screen_msg, ""); // 永不返回（成功后重启）
+        }
+    } else {
+        if (row == 0) { // 睡眠
+            g_popup_menu_open = false;
+            Serial.println("[菜单] 睡眠");
+            enter_sleep();
+        } else if (row == 1) { // WiFi 配网
+            g_popup_menu_open = false;
+            Serial.println("[菜单] WiFi 配网");
+            run_provisioning_portal(screen_msg, ""); // 永不返回（成功后重启）
+        } else if (row == 2) { // 重新登录
+            g_popup_menu_open = false;
+            Serial.println("[菜单] 重新登录");
+            shelf_relogin();
+        }
     }
     return true;
 }
@@ -820,6 +949,8 @@ static void show_shelf(bool fast = false) {
 
     // 标题行：右上角只留状态栏图标（电量+WiFi 最右），无文字入口（弹出式菜单）
     draw_status_icons(12);
+    // v0.3.0：离线模式提示（左上角）
+    if (g_offline_mode) drawUI("离线", 20, 16);
 
     int row_h = shelf_row_h();
     int total_pages = max(1, ((int)g_shelf.size() + SHELF_PER_PAGE - 1) / SHELF_PER_PAGE);
@@ -954,6 +1085,9 @@ static void detail_cache_save(const String& bookId, const BookDetail& d, const s
     if (!storage_sd_ok()) return;
     if (!d.intro.length() && revs.empty()) return; // 空详情不缓存（多半是临时失败）
     JsonDocument doc;
+    doc["title"] = d.title;   // v0.3.0：离线书架用（书名/作者/封面）
+    doc["author"] = d.author;
+    doc["cover"] = d.cover;
     doc["i"] = d.intro;
     doc["p"] = d.publisher;
     JsonArray arr = doc["r"].to<JsonArray>();
@@ -1259,7 +1393,7 @@ static void enter_sleep() {
             drawUI(t, (SCREEN_W - textWidthUI(t)) / 2, 430);
         }
         drawUI(truncate_px(b.title, 460), 24, SCREEN_H - 120);
-        drawUI("已休眠 · 摸屏幕唤醒", 24, SCREEN_H - 64);
+        drawUI("已休眠 · 双击屏幕唤醒", 24, SCREEN_H - 64);
     } else {
         String t = "微信读书";
         drawUI(t, (SCREEN_W - textWidthUI(t)) / 2, 430);
@@ -1269,32 +1403,61 @@ static void enter_sleep() {
     M5.Display.waitDisplay();
     delay(2000);            // 等波形真正刷完再断 EPD 电（M5ReadPaper 经验）
     M5.Display.sleep();     // EPD 断电（墨水屏图像永久保持）
-    Serial.println("[睡眠] 进入浅睡，摸屏幕唤醒");
-    M5.Power.lightSleep(0, true); // 浅睡 + GPIO48 触摸唤醒（内部含防误醒等待），醒后从下一行继续
-    // ---- 唤醒点（程序原地恢复，不重启）----
-    Serial.println("[睡眠] 已唤醒");
-    M5.Display.wakeup();    // EPD 重新上电
-    g_last_activity = millis();
-    // 浅睡期间 WiFi 断开：重连 + 重新校时
-    if (WiFi.status() != WL_CONNECTED) {
-        // 重连失败不能放过去：没网这台设备就废了，重试到连上（中间允许点按再试）
-        int tries = 0;
-        while (true) {
-            canvas.fillSprite(TFT_WHITE);
-            drawUI(tries ? "WiFi 重连中..." : "已唤醒，正在连接 WiFi...", 24, 400);
-            epd_flush(epd_mode_t::epd_fast);
-            if (WR.connectWiFi()) break;
-            if (++tries >= 3) {
-                screen_msg("WiFi 连接失败", "点按屏幕重试", "");
-                wait_tap(120000);
-                tries = 0;
+    // v0.3.0：浅睡前断 WiFi（省电，醒后手动/自动重连）
+    Serial.println("[睡眠] 断开 WiFi（省电）");
+    WiFi.disconnect(true, false); // wifioff=true，不清已存 AP
+    Serial.println("[睡眠] 进入浅睡，双击屏幕唤醒");
+    // v0.3.0：双击唤醒——单击只把芯片叫醒（EPD 仍断电，屏幕无变化），
+    // 700ms 内等到"第二次按下"才真正唤醒；等不到就回去接着睡。
+    // FT3267 中断驱动，芯片唤醒后持续上报，同一按下的多个事件时间差 <50ms，
+    // 必须靠时间戳去重，只认 >50ms 的第二次按下才算真双击。
+    while (true) {
+        M5.Power.lightSleep(0, true); // 浅睡 + GPIO48 触摸唤醒，醒后从下一行继续
+        // 第一击的按下/抬起事件已进队列，先全部读出来丢掉，同时记录第一击时间
+        TouchPoint pt;
+        unsigned long first_press_ms = 0;
+        while (g_touch_q && xQueueReceive(g_touch_q, &pt, 0)) {
+            if (first_press_ms == 0) first_press_ms = millis();
+        }
+        if (first_press_ms == 0) first_press_ms = millis(); // 队列空（理论上不会），用当前时间
+        // 700ms 窗口内等第二击：与第一击时间差 >50ms 才算有效（过滤同一按下的连续上报）
+        unsigned long deadline = millis() + 700;
+        bool double_tap = false;
+        while (millis() < deadline) {
+            uint32_t wait_ms = deadline - millis();
+            if (wait_ms > 50) wait_ms = 50; // 分段等，防 deadline 溢出
+            if (g_touch_q && xQueueReceive(g_touch_q, &pt, pdMS_TO_TICKS(wait_ms))) {
+                if (millis() - first_press_ms > 50) { // 与第一击时间差 >50ms 才算第二击
+                    double_tap = true;
+                    break;
+                }
             }
         }
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        if (double_tap) {
+            Serial.println("[睡眠] 检测到双击，唤醒");
+            break;
+        }
+        Serial.println("[睡眠] 单击（非双击），继续睡");
     }
-    // 重绘当前界面，原地恢复
+    // ---- 唤醒点（程序原地恢复，不重启）----
+    Serial.println("[睡眠] 已唤醒（双击）");
+    M5.Display.wakeup();    // EPD 重新上电
+    g_last_activity = millis();
+    // v0.3.0：先回界面（阅读页/书架页），WiFi 重连挪到后台静默进行，不弹"已唤醒，正在连接 WiFi"
     if (g_screen == SCR_READING && !g_pages.empty()) render_page(epd_mode_t::epd_quality, true);
     else show_shelf();
+    // 后台静默重连 WiFi（不阻塞 UI；失败保持离线模式，用户可点右上角手动重连）
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[wifi] 后台静默重连中...");
+        if (WR.connectWiFiMulti()) {
+            g_offline_mode = false;
+            Serial.println("[wifi] 后台重连成功");
+            configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        } else {
+            g_offline_mode = true;
+            Serial.println("[wifi] 后台重连失败，保持离线模式（点右上角图标手动重连）");
+        }
+    }
     if (g_touch_q) xQueueReset(g_touch_q); // 丢掉唤醒那次触摸事件
 }
 
@@ -2134,14 +2297,20 @@ void setup() {
     }
 
     splash_status("正在连接 WiFi...");
-    if (!WR.connectWiFi()) {
-        Serial.println("[错误] WiFi 连接失败");
-        run_provisioning_portal(screen_msg, "连接超时/密码错误"); // 永不返回（成功后重启）
+    // v0.3.0：多账号扫描连接（扫到哪个已存 AP 连哪个）
+    if (!WR.connectWiFiMulti()) {
+        Serial.println("[错误] 所有已存 WiFi 都连不上");
+        // 离线模式：不进配网门户，直接进书架看缓存书（用户可点右上角手动重连/配网）
+        g_offline_mode = true;
+        screen_msg("WiFi 未连接", "显示已下载的书", "点右上角图标重连");
+        delay(1000); // 提示缩短：书架页已有"离线"标记+断开图标，不用长等
+    } else {
+        g_offline_mode = false;
     }
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // 校时（进度上传签名用 ts）
+    if (!g_offline_mode) configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // 校时（进度上传签名用 ts）
 
-    // 无登录态 → 直接扫码登录（有 WiFi 配置就不该回配网门户）
-    if (!WR.hasValidCookie()) {
+    // 无登录态 → 直接扫码登录（有 WiFi 配置就不该回配网门户；离线模式跳过）
+    if (!g_offline_mode && !WR.hasValidCookie()) {
         Serial.println("[login] 无登录态，进入扫码登录");
         if (!do_qr_login()) {
             screen_msg("登录未完成", "点按屏幕重启");
@@ -2151,48 +2320,57 @@ void setup() {
     }
 
     // 主动续期：wr_skey 是短效令牌（几小时过期），有 wr_rt 就能换新，不用天天扫码
-    if (WR.hasValidCookie()) {
+    if (!g_offline_mode && WR.hasValidCookie()) {
         if (WR.tryRenew()) Serial.println("[cfg] 令牌已续期");
         else Serial.println("[cfg] 续期失败（若书架也 401 才需要重扫）");
     }
 
-    // ---- 拉书架（兼 cookie 有效性检查；过期先续期，续不动再扫码登录）----
-    splash_status("正在加载书架...");
-    String err;
-    if (!weread_api::getBookshelf(g_shelf, err) || g_shelf.empty()) {
-        if (err.indexOf("-2012") >= 0) {
-            Serial.println("[login] cookie 过期(-2012)，先试 renewal 续期");
-            if (WR.tryRenew()) {
-                err = "";
-                splash_status("正在加载书架...");
-                weread_api::getBookshelf(g_shelf, err); // 续期成功重拉
+    // ---- 拉书架（离线模式跳过，直接进书架看缓存书）----
+    if (!g_offline_mode) {
+        splash_status("正在加载书架...");
+        String err;
+        if (!weread_api::getBookshelf(g_shelf, err) || g_shelf.empty()) {
+            if (err.indexOf("-2012") >= 0) {
+                Serial.println("[login] cookie 过期(-2012)，先试 renewal 续期");
+                if (WR.tryRenew()) {
+                    err = "";
+                    splash_status("正在加载书架...");
+                    weread_api::getBookshelf(g_shelf, err); // 续期成功重拉
+                }
             }
-        }
-        if (err.indexOf("-2012") >= 0) { // 续期也不行（wr_rt 死了）→ 扫码
-            Serial.println("[login] 续期失败，进入扫码登录");
-            if (do_qr_login()) {
-                err = "";
-                splash_status("正在加载书架...");
-                if (!weread_api::getBookshelf(g_shelf, err) || g_shelf.empty()) {
-                    screen_msg("书架获取失败", err, "点按屏幕重启");
+            if (err.indexOf("-2012") >= 0) { // 续期也不行（wr_rt 死了）→ 扫码
+                Serial.println("[login] 续期失败，进入扫码登录");
+                if (do_qr_login()) {
+                    err = "";
+                    splash_status("正在加载书架...");
+                    if (!weread_api::getBookshelf(g_shelf, err) || g_shelf.empty()) {
+                        screen_msg("书架获取失败", err, "点按屏幕重启");
+                        wait_tap(600000);
+                        ESP.restart();
+                    }
+                } else {
+                    screen_msg("登录未完成", "点按屏幕重启");
                     wait_tap(600000);
                     ESP.restart();
                 }
-            } else {
-                screen_msg("登录未完成", "点按屏幕重启");
+            } else if (err.length() || g_shelf.empty()) {
+                screen_msg("书架获取失败", err, "点按屏幕重启");
                 wait_tap(600000);
                 ESP.restart();
             }
-        } else if (err.length() || g_shelf.empty()) {
-            screen_msg("书架获取失败", err, "点按屏幕重启");
-            wait_tap(600000);
-            ESP.restart();
         }
+    } else {
+        Serial.println("[离线] 跳过书架加载，显示已下载的书");
+        // 离线模式：扫描 SD 缓存目录，构造简易书架（只有已下载的书）
+        shelf_load_offline();
     }
-    Serial.printf("[书架] %d 本\n", g_shelf.size());
-    sort_shelf_recent();
-    for (size_t i = 0; i < g_shelf.size(); i++) // 排序后打印，串口序号与屏幕一致
-        Serial.printf("  %d. %s [%s] 进度%d%%\n", i + 1, g_shelf[i].title.c_str(), g_shelf[i].bookId.c_str(), g_shelf[i].progress);
+    Serial.printf("[书架] %d 本%s\n", g_shelf.size(), g_offline_mode ? "（离线模式，只显示已下载）" : "");
+    if (!g_offline_mode) {
+        sort_shelf_recent();
+        shelf_cache_save(); // v0.3.0：在线拉书架成功后保存缓存（离线模式用）
+        for (size_t i = 0; i < g_shelf.size(); i++) // 排序后打印，串口序号与屏幕一致
+            Serial.printf("  %d. %s [%s] 进度%d%%\n", i + 1, g_shelf[i].title.c_str(), g_shelf[i].bookId.c_str(), g_shelf[i].progress);
+    }
     if (g_touch_q) xQueueReset(g_touch_q); // 清掉启动期间的点按
     if (!try_restore_reading()) show_shelf(); // 有睡眠标记则直接回上次阅读页
     g_last_activity = millis();

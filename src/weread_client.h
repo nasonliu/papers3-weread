@@ -31,6 +31,10 @@ public:
     // 从 SPIFFS 配置加载 WiFi 凭据与 weread cookie
     bool loadConfig();
     bool connectWiFi(unsigned long timeout_ms = 15000);
+    // v0.3.0：多 WiFi 账号——扫描可见 AP，按列表顺序连扫到的（10s/个）
+    bool connectWiFiMulti(unsigned long per_ap_timeout_ms = 8000);
+    // 配网门户成功后把新账号追加进 wifi_list（去重）
+    static void addWiFiToList(const String& ssid, const String& pass);
 
     // cookie 操作
     void setCookie(const String& name, const String& value);
@@ -55,6 +59,8 @@ public:
 
     // 配置值（从配置文件读入）
     String wifi_ssid, wifi_pass;
+    // v0.3.0：多 WiFi 账号列表（config "wifi_list" 数组 [{ssid,pass},...]；老格式单 wifi_ssid 自动并入）
+    std::vector<std::pair<String,String>> wifi_list;
     String cfg_wr_vid, cfg_wr_skey, cfg_wr_rt, cfg_api_key;
     String cfg_font; // 字体文件路径（config "font" 字段，可空=默认字体）
 
